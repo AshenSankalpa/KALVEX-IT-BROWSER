@@ -271,13 +271,23 @@ ipcMain.handle('close-window', () => {
 // standing rule (see resolvePrinterName's comment below) is that a printer
 // mismatch/failure must fail loudly rather than risk cross-printing a
 // receipt onto whatever printer happens to be set as Windows default.
-ipcMain.on('print-receipt', (event, options = {}) => {
+ipcMain.on('print-receipt', async (event, options = {}) => {
   const isSilent = options.silent !== undefined ? options.silent : true;
+
+  // Same resolve-before-print standard as the two main handlers below, even
+  // though this channel's target is already hardcoded (never empty) — this
+  // just turns a would-be generic native print failure into a clear,
+  // actionable log line before we even try.
+  const { matched, available } = await resolvePrinterName('CashierPrinter');
+  if (!matched) {
+    console.error(`print-receipt: CashierPrinter not found. Available: ${available.join(', ') || '(none detected)'}`);
+    return;
+  }
 
   mainWindow.webContents.print({
     silent: isSilent,
     printBackground: true,
-    deviceName: 'CashierPrinter'
+    deviceName: matched
   }, (success, failureReason) => {
     if (!success) {
       console.error('CashierPrinter print failed (no default-printer fallback):', failureReason);
@@ -286,7 +296,13 @@ ipcMain.on('print-receipt', (event, options = {}) => {
 });
 
 // 2. KITCHEN KOT AUTO-PRINT
-ipcMain.on('print-kot', (event, kotHtml) => {
+ipcMain.on('print-kot', async (event, kotHtml) => {
+  const { matched, available } = await resolvePrinterName('KitchenPrinter');
+  if (!matched) {
+    console.error(`print-kot: KitchenPrinter not found. Available: ${available.join(', ') || '(none detected)'}`);
+    return;
+  }
+
   let workerWindow = new BrowserWindow({
     show: false,
     webPreferences: { nodeIntegration: false }
@@ -297,7 +313,7 @@ ipcMain.on('print-kot', (event, kotHtml) => {
   workerWindow.webContents.on('did-finish-load', () => {
     workerWindow.webContents.print({
       silent: true,
-      deviceName: 'KitchenPrinter'
+      deviceName: matched
     }, (success, errorType) => {
       if (!success) console.error('Kitchen Print Error:', errorType);
       workerWindow.close();
@@ -306,7 +322,13 @@ ipcMain.on('print-kot', (event, kotHtml) => {
 });
 
 // 3. BARCODE STICKER LABEL AUTO-PRINT
-ipcMain.on('print-barcode', (event, barcodeHtml) => {
+ipcMain.on('print-barcode', async (event, barcodeHtml) => {
+  const { matched, available } = await resolvePrinterName('BarcodePrinter');
+  if (!matched) {
+    console.error(`print-barcode: BarcodePrinter not found. Available: ${available.join(', ') || '(none detected)'}`);
+    return;
+  }
+
   let workerWindow = new BrowserWindow({
     show: false,
     webPreferences: { nodeIntegration: false }
@@ -317,7 +339,7 @@ ipcMain.on('print-barcode', (event, barcodeHtml) => {
   workerWindow.webContents.on('did-finish-load', () => {
     workerWindow.webContents.print({
       silent: true,
-      deviceName: 'BarcodePrinter'
+      deviceName: matched
     }, (success, errorType) => {
       if (!success) console.error('Barcode Print Error:', errorType);
       workerWindow.close();
@@ -333,6 +355,7 @@ const DEFAULT_DEVICE_NAMES = {
   cashier: 'CashierPrinter',
   kitchen: 'KitchenPrinter',
   bot: 'BarPrinter',
+  bar: 'BarPrinter',
   barcode: 'BarcodePrinter'
 };
 
@@ -367,21 +390,35 @@ async function resolvePrinterName(requestedName) {
   return { matched: exact ? exact.name : null, available };
 }
 
-function buildPrintDocument(htmlContent, paperWidthMm, paperHeightMm) {
+// Physical printable head is narrower than nominal paper width on thermal
+// rolls — industry-standard figures (also used elsewhere in this file):
+// 80mm paper -> 72mm head (576 dots @ 203dpi), 58mm paper -> 48mm head
+// (384 dots @ 203dpi). An explicit non-standard width is trusted as-is, since
+// that represents deliberate custom hardware, not one of these two defaults.
+function getPrintableWidthMm(nominalWidthMm) {
+  if (nominalWidthMm === 80) return 72;
+  if (nominalWidthMm === 58) return 48;
+  return nominalWidthMm;
+}
+
+function buildPrintDocument(htmlContent, nominalWidthMm, paperHeightMm) {
   const pageHeight = paperHeightMm ? `${paperHeightMm}mm` : 'auto';
 
+  // Base reset only — the actual width containment (and the zoom that
+  // compensates for any genuinely fixed-pixel content) is applied after load
+  // via insertCSS/setZoomFactor in printSilentJob, same as print-receipt-silent.
   return `<!DOCTYPE html>
 <html>
 <head>
 <meta charset="utf-8">
 <style>
   @page {
-    size: ${paperWidthMm}mm ${pageHeight};
+    size: ${nominalWidthMm}mm ${pageHeight};
     margin: 0;
   }
   * { box-sizing: border-box; }
   html, body {
-    width: ${paperWidthMm}mm;
+    width: 100%;
     margin: 0;
     padding: 0;
     font-family: monospace;
@@ -403,14 +440,25 @@ ${htmlContent}
 async function printSilentJob({ type, htmlContent, settings = {} } = {}) {
   const paperWidthMm = settings.paperWidthMm || DEFAULT_PAPER_WIDTH_MM;
   const paperHeightMm = settings.paperHeightMm || null;
+  const printableWidthMm = getPrintableWidthMm(paperWidthMm);
 
-  const widthMicrons = paperWidthMm * 1000;
+  const widthMicrons = printableWidthMm * 1000;
   const heightMicrons = paperHeightMm
     ? paperHeightMm * 1000
     : DEFAULT_CONTINUOUS_HEIGHT_MICRONS;
 
+  // settings.deviceName is the documented/preferred key; the rest are
+  // defensive fallbacks in case a caller uses a different property name for
+  // the same thing (e.g. a "printerName" written straight onto settings
+  // instead of nested correctly) — all still funnel through the same
+  // resolvePrinterName exact-match check below, so a wrong guess here just
+  // fails with a clear "Printer not found" error, never a silent misroute.
   const requestedDeviceName =
     settings.deviceName ||
+    settings.printerName ||
+    settings.printer ||
+    settings.device ||
+    settings.name ||
     DEFAULT_DEVICE_NAMES[type] ||
     DEFAULT_DEVICE_NAMES.cashier;
 
@@ -427,8 +475,23 @@ async function printSilentJob({ type, htmlContent, settings = {} } = {}) {
   return new Promise((resolve) => {
     const fullHtml = buildPrintDocument(htmlContent || '', paperWidthMm, paperHeightMm);
 
+    // Explicit narrow viewport matching the printable head — without this,
+    // Chromium lays the DOM out against its default 800px-wide window, and
+    // the pageSize above then stretches or shrinks that mismatched layout
+    // onto the actual physical page.
+    //
+    // UNIT NOTE: BrowserWindow width/height are CSS/device-independent
+    // pixels (96 per inch), NOT thermal printer dots (203 per inch) — an
+    // earlier version of this line used *203, which made the actual viewport
+    // roughly double the real printable width (same bug print-receipt-silent
+    // had further up in this file, fixed the same way there).
+    const targetWidthPx = Math.round((printableWidthMm / 25.4) * 96);
+
     let win = new BrowserWindow({
       show: false,
+      width: targetWidthPx,
+      height: 1200,
+      useContentSize: true,
       webPreferences: {
         nodeIntegration: false,
         contextIsolation: true
@@ -462,7 +525,37 @@ async function printSilentJob({ type, htmlContent, settings = {} } = {}) {
       finish({ success: false, error: errorDescription || `load-failed-${errorCode}` });
     });
 
-    win.webContents.once('did-finish-load', () => {
+    win.webContents.once('did-finish-load', async () => {
+      // Reset to 1.0: no hardware result or diagnostic log came back on the
+      // 0.85 attempt, and this round switches the shrink mechanism to a CSS
+      // transform on <html> instead (see insertCSS below) — same reasoning
+      // as print-receipt-silent's equivalent comment.
+      const zoomFactor = 1.0;
+      win.webContents.setZoomFactor(zoomFactor);
+
+      // Same transform-based shrink as print-receipt-silent, switched to a
+      // center-anchored scale for symmetric margins — see that handler's
+      // comment for the full reasoning. Not applied to barcode jobs, which
+      // have their own exact physical dimensions.
+      await win.webContents.insertCSS(`
+        ${type === 'barcode' ? '' : `
+        html {
+          transform: scale(0.97) !important;
+          transform-origin: top center !important;
+          width: 100% !important;
+        }
+        `}
+        body {
+          margin: 0 !important;
+          padding: 0 !important;
+          box-sizing: border-box !important;
+        }
+        table {
+          width: 100% !important;
+          table-layout: fixed !important;
+        }
+      `);
+
       const baseOptions = {
         silent: true,
         printBackground: true,
@@ -470,6 +563,16 @@ async function printSilentJob({ type, htmlContent, settings = {} } = {}) {
         landscape: false,
         margins: { marginType: 'none' }
       };
+
+      // Diagnostic: after two rounds of substantial, different structural
+      // fixes producing "identical" clipping on real hardware, this confirms
+      // — on the NEXT test — whether this code path actually ran with the
+      // values it's supposed to, rather than guessing again blind.
+      console.log(
+        `[print-silent-job] printing: type=${type} printer="${deviceName}" ` +
+        `zoomFactor=${zoomFactor} targetWidthPx=${targetWidthPx} ` +
+        `printableWidthMm=${printableWidthMm} pageSize=${widthMicrons}x${heightMicrons}um`
+      );
 
       // Same same-device geometry retry as print-receipt-silent: some Windows
       // print drivers hard-reject a custom pageSize that isn't a registered
@@ -539,13 +642,26 @@ ipcMain.handle('print-receipt-silent', async (event, payload, ...args) => {
 
     if (typeof payload === 'object' && payload !== null) {
       html = payload.html || payload.htmlContent || '';
-      printerName = payload.printerName || payload.targetPrinter || '';
+      // printerName/targetPrinter are the documented/preferred keys; the rest
+      // are defensive fallbacks for an alternate property name. If NONE of
+      // them are present at all, default to the cashier printer — same
+      // app-level "no target specified" default printSilentJob already uses
+      // (DEFAULT_DEVICE_NAMES[type] || DEFAULT_DEVICE_NAMES.cashier). This is
+      // NOT a retry against whatever Windows' OS default queue is; it still
+      // funnels through resolvePrinterName's exact-match check below, so if
+      // "CashierPrinter" itself isn't actually installed, this still fails
+      // loudly rather than guessing further — see resolvePrinterName's own
+      // comment for that policy.
+      printerName = payload.printerName || payload.targetPrinter || payload.printer || payload.name || payload.device || DEFAULT_DEVICE_NAMES.cashier;
       paperWidth = payload.paperWidth || '80mm';
       isLabel = !!payload.isLabel;
       if (payload.customHeightMicrons) customHeight = payload.customHeightMicrons;
     } else {
+      // A bare string payload (the Hardware Setup Test Print button calls it
+      // this way — just the HTML, no printer specified, zero extra args) also
+      // defaults to the cashier printer rather than resolving to "".
       html = payload || '';
-      printerName = args[0] || '';
+      printerName = args[0] || DEFAULT_DEVICE_NAMES.cashier;
       paperWidth = args[1] || '80mm';
     }
 
@@ -565,11 +681,11 @@ ipcMain.handle('print-receipt-silent', async (event, payload, ...args) => {
       return { success: false, error };
     }
 
-    // Zoom stays at 1.0 here: the widthMicrons values below already match the
-    // physical printable head (not the nominal paper width), and the window's
-    // own viewport (targetWidthPx) is laid out at that same physical size —
-    // once the viewport and the page size agree, no compensating zoom is
-    // needed, and adding one just reintroduces a scale mismatch.
+    // Reset to 1.0: no hardware result or diagnostic log came back on the
+    // 0.85 attempt, and this round switches the shrink mechanism to a CSS
+    // transform on <html> instead (see insertCSS below). Running both at
+    // once would make it impossible to tell which one actually did anything
+    // if the next test is inconclusive again — this keeps the test isolated.
     let zoomFactor = 1.0;
     // 72mm, not 80mm: the confirmed physical printable head on an "80mm" roll
     // is 72mm (576 dots @ 203dpi — this is also the standard Epson TM-T88-class
@@ -589,14 +705,23 @@ ipcMain.handle('print-receipt-silent', async (event, payload, ...args) => {
       customHeight = (payload && payload.labelHeightMicrons) || 30000;
     }
 
-    // Explicit thermal-head line-buffer pixel width (576px @ 80mm / 384px @ 58mm,
-    // standard ESC/POS dot widths at 203dpi) as the window's own viewport —
-    // without this, Chromium lays the DOM out against its default 800px-wide
-    // viewport, and payloads that use screen-style percentage/fixed-pixel widths
-    // (rather than proper @page print CSS) get laid out at that width and then
-    // scaled DOWN to fit the physical page, which is what produced the shrunk,
-    // centered-with-margins output on hardware despite the zoom/CSS changes.
-    const targetWidthPx = paperWidth === '58mm' ? 384 : 576;
+    const printableWidthMm = widthMicrons / 1000;
+
+    // Explicit narrow viewport matching the printable head — without this,
+    // Chromium lays the DOM out against its default 800px-wide window, and
+    // payloads using screen-style percentage/fixed-pixel widths get laid out
+    // at that width and then squeezed onto the physical page.
+    //
+    // IMPORTANT UNIT NOTE: BrowserWindow width/height are CSS/device-
+    // independent pixels (96 per inch, the standard web reference unit) —
+    // NOT thermal printer dots (203 per inch). An earlier version of this
+    // code used 576/384, which are the correct DOT counts for 72mm/48mm at
+    // 203dpi, but used them directly as a CSS-pixel BrowserWindow width —
+    // making the actual viewport ~152mm/~102mm, roughly DOUBLE the real
+    // printable width. That mismatch likely explains why the right edge kept
+    // clipping identically across CSS-only fix attempts: the canvas itself
+    // was never actually narrow. Converting properly at 96dpi here instead.
+    const targetWidthPx = Math.round((printableWidthMm / 25.4) * 96);
 
     printWin = new BrowserWindow({
       show: false,
@@ -612,83 +737,64 @@ ipcMain.handle('print-receipt-silent', async (event, payload, ...args) => {
     await printWin.loadURL(`data:text/html;charset=utf-8,${encodeURIComponent(html)}`);
     printWin.webContents.setZoomFactor(zoomFactor);
 
-    // Strips Chromium's default print margins/centering so the zoomed content
-    // occupies the full page width edge-to-edge rather than sitting centered
-    // with blank side margins. Uses universal element selectors instead of
-    // guessing the receipt payload's own class/id names, since those didn't
-    // match the live DOM on hardware and left the width override a no-op.
+    // CSS transform on <html> as the shrink mechanism — hardware-confirmed
+    // this works. transform-origin switched from "top left" to "top center":
+    // scaling from a corner always pushes ALL the freed-up blank space to one
+    // side (asymmetric margins, by definition); scaling from the center
+    // distributes it evenly on both sides, which is the correct tool for a
+    // "balanced margins" goal regardless of which side was previously larger.
+    // Also dropped the width:105.3% pre-widening (was compensating for the
+    // corner-anchored scale eating into the page's own footprint) in favor
+    // of a gentler 0.97 scale alone — if right-edge clipping reappears, this
+    // combination (no pre-widening + a milder scale) is the first thing to
+    // revisit, since the widening was giving fixed-pixel content extra
+    // layout room independent of the final visual scale.
+    // table-layout:fixed is kept — it stops a table growing past its column
+    // hints to fit long cell content (e.g. an AMOUNT column), which is a
+    // separate problem from overall page scale/centering.
     await printWin.webContents.insertCSS(`
       @page {
         margin: 0 !important;
-        size: ${isLabel ? 'auto' : `${paperWidth} auto`} !important;
+        size: ${isLabel ? `${paperWidth} auto` : 'auto'} !important;
       }
-      html, body {
+      ${isLabel ? '' : `
+      html {
+        transform: scale(0.97) !important;
+        transform-origin: top center !important;
+        width: 100% !important;
+      }
+      `}
+      body {
         margin: 0 !important;
         padding: 0 !important;
-        width: 100% !important;
         box-sizing: border-box !important;
       }
-      body > div, body > div > div, table {
+      table {
         width: 100% !important;
-        max-width: 100% !important;
-        margin-left: 0 !important;
-        margin-right: 0 !important;
-        box-sizing: border-box !important;
+        table-layout: fixed !important;
       }
     `);
 
     // Belt-and-braces: some receipt payloads hardcode inline pixel widths
     // (style="width:300px") or centering (margin:auto) that a stylesheet rule
     // can only beat with !important, and deeply-nested wrappers can sit past
-    // the insertCSS selectors above. Force every element's inline style directly.
+    // the insertCSS selectors above. Force every element's inline style
+    // directly, using setProperty(...,'important') — a plain assignment like
+    // el.style.width = '92%' would lose to the !important CSS rules above.
+    // EXCLUDES <html> itself: max-width clamps width regardless of !important
+    // on either side (it's not a cascade conflict, it's how the box model
+    // resolves the two together), so forcing max-width:100% on <html> would
+    // silently cancel the deliberate width:100% rule above.
     await printWin.webContents.executeJavaScript(`
       (() => {
         document.querySelectorAll('*').forEach((el) => {
-          if (el.style) {
-            el.style.maxWidth = '100%';
-            el.style.boxSizing = 'border-box';
+          if (el.style && el !== document.documentElement) {
+            el.style.setProperty('max-width', '100%', 'important');
+            el.style.setProperty('box-sizing', 'border-box', 'important');
             if (el.style.marginLeft === 'auto') el.style.marginLeft = '0px';
             if (el.style.marginRight === 'auto') el.style.marginRight = '0px';
           }
         });
-
-        document.documentElement.style.width = '100%';
-        document.documentElement.style.margin = '0';
-        document.documentElement.style.padding = '0';
-        document.body.style.width = '100%';
-        document.body.style.margin = '0';
-        document.body.style.padding = '0';
-
-        document.querySelectorAll('table').forEach((tbl) => {
-          tbl.style.width = '100%';
-          tbl.style.maxWidth = '100%';
-        });
-
-        // Fixed hardware-measured safety inset on the main print container
-        // (69mm box + 3mm right padding, hard-capped with overflow:hidden) so a
-        // font-metric or box-model rounding error can't push the last column
-        // past the head, now that the viewport/pageSize width already match the
-        // real 72mm/48mm printable area above. Deliberately NOT applied to
-        // html/body themselves (left at 100% = the full page canvas) — doing
-        // both would stack two insets (page-vs-box AND box-vs-padding) into an
-        // unintended ~6mm+3mm margin, right back to the "too much blank space"
-        // complaint from earlier hardware rounds.
-        const printArea = document.querySelector('#receipt-root') ||
-                           document.querySelector('.receipt-container') ||
-                           document.querySelector('#receipt-print-area') ||
-                           document.querySelector('.receipt-main-container') ||
-                           document.querySelector('.print-content') ||
-                           document.body.firstElementChild;
-
-        if (printArea && printArea.style) {
-          printArea.style.width = '69mm';
-          printArea.style.maxWidth = '69mm';
-          printArea.style.paddingRight = '3mm';
-          printArea.style.marginLeft = '0px';
-          printArea.style.marginRight = 'auto';
-          printArea.style.boxSizing = 'border-box';
-          printArea.style.overflow = 'hidden';
-        }
       })();
     `);
 
@@ -716,6 +822,22 @@ ipcMain.handle('print-receipt-silent', async (event, payload, ...args) => {
       margins: { marginType: 'none' }
     };
 
+    // Diagnostic: after two rounds of substantial, different structural
+    // fixes producing "identical" clipping on real hardware, this confirms
+    // — on the NEXT test — whether this code path actually ran with the
+    // values it's supposed to, rather than guessing again blind.
+    console.log(
+      `[print-receipt-silent] printing: printer="${printerName}" paperWidth=${paperWidth} ` +
+      `isLabel=${isLabel} zoomFactor=${zoomFactor} targetWidthPx=${targetWidthPx} ` +
+      `printableWidthMm=${printableWidthMm} pageSize=${widthMicrons}x${customHeight}um`
+    );
+
+    // scaleFactor stays 100 here deliberately — the actual size reduction is
+    // already applied via zoomFactor above (webContents.setZoomFactor runs
+    // before this print() call). print()'s own scaleFactor option is a
+    // SEPARATE additional scale layered on top of whatever was rendered, so
+    // setting both to 90 would compound to 0.9 x 0.9 = 0.81 (a 19% shrink),
+    // not the intended 10%.
     const first = await printOnce({
       ...baseOptions,
       pageSize: { width: widthMicrons, height: customHeight },
