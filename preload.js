@@ -7,24 +7,53 @@ contextBridge.exposeInMainWorld('electronAPI', {
   printBarcode: (barcodeHtml) => ipcRenderer.send('print-barcode', barcodeHtml),
 
   // --- New unified silent print bridge ---
-  // data: { type: 'cashier' | 'kitchen' | 'bot' | 'barcode', htmlContent: string,
+  // data: { type: 'cashier' | 'kitchen' | 'kot' | 'bot' | 'bar' | 'barcode', htmlContent: string,
   //         settings?: { deviceName?: string, paperWidthMm?: number, paperHeightMm?: number } }
   // Returns: Promise<{ success: boolean, error: string | null }>
   // On a printer-name mismatch this resolves { success: false, error } listing
   // the requested name and the actually-installed printers — it does not
   // guess via a partial/"contains" match or fall back to the OS default.
-  sendPrintJob: (data) => ipcRenderer.invoke('print-silent-job', data),
+  // print-silent-job's handler only reads a single `data` argument (no
+  // positional-args support like printReceiptSilent below), so this stays
+  // single-argument by design — call it as sendPrintJob({...}), one object.
+  sendPrintJob: (data) => {
+    console.log('[IPC RAW ARGS] sendPrintJob called with:', data);
+    return ipcRenderer.invoke('print-silent-job', data);
+  },
 
   // --- Dynamic printer discovery ---
   // Returns: Promise<Array<{ name, displayName, isDefault, status }>>
   getPrinters: () => ipcRenderer.invoke('get-system-printers'),
 
+  // --- Quick diagnostic: just the printer names, for startup logging ---
+  // Returns: Promise<string[]>
+  getAvailablePrinters: () => ipcRenderer.invoke('get-available-printers'),
+
   // --- Multi-target silent print engine (role routing + thermal safe-scaling) ---
-  // payload: { html, printerName, paperWidth?: '80mm'|'58mm', isLabel?: boolean,
-  //            labelWidthMicrons?, labelHeightMicrons?, customHeightMicrons? }
+  // Accepts EITHER a single object payload:
+  //   { html, printerName, paperWidth?: '80mm'|'58mm', isLabel?: boolean,
+  //     labelWidthMicrons?, labelHeightMicrons?, customHeightMicrons? }
+  // OR positional arguments: (html, printerName, paperWidth) — main.js's
+  // handler supports both. THIS MUST STAY VARIADIC (...args), not a single
+  // named parameter: an earlier version was `(payload) => invoke(..., payload)`,
+  // which silently dropped every argument after the first — a frontend call
+  // like printReceiptSilent(html, 'KitchenPrinter') had its printer name
+  // discarded right here, before it ever reached main.js, which then fell
+  // through to the CashierPrinter default. That was the actual root cause of
+  // a KOT-always-prints-on-cashier bug — not a bug in main.js's routing logic
+  // at all, which was reading the (already-empty) args correctly the whole time.
   // Returns: Promise<{ success: boolean, error: string | null }>
   // Same exact-match-only printer resolution as sendPrintJob above.
-  printReceiptSilent: (payload) => ipcRenderer.invoke('print-receipt-silent', payload),
+  printReceiptSilent: (...args) => {
+    console.log('[IPC RAW ARGS] printReceiptSilent called with:', args);
+    return ipcRenderer.invoke('print-receipt-silent', ...args);
+  },
+
+  // --- Cash drawer kick (no printing, no paper feed) ---
+  // payload?: { deviceName?: string, printerName?: string } — defaults to
+  // the cashier printer. Returns: Promise<{ success: boolean, error: string | null }>
+  // Same exact-match-only printer resolution as sendPrintJob above.
+  openCashDrawer: (payload) => ipcRenderer.invoke('open-cash-drawer', payload),
 
   // --- Kiosk window control (for touch terminals with no physical Esc/F11 key) ---
   // Both return Promise<boolean>: true = window is now/currently in kiosk mode.

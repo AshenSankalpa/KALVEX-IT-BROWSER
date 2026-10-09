@@ -1,5 +1,8 @@
 const { app, BrowserWindow, ipcMain } = require('electron');
 const path = require('path');
+const fs = require('fs');
+const os = require('os');
+const { exec } = require('child_process');
 
 const POS_URL = 'https://virelpos.kalvexit.com';
 
@@ -239,6 +242,107 @@ ipcMain.handle('get-system-printers', async () => {
   }
 });
 
+// Quick diagnostic: just the printer names Windows currently sees, for
+// startup logging (frontend or terminal) — get-system-printers above
+// already covers this with richer per-printer detail (displayName,
+// isDefault, status); this is a thinner, simpler companion for a quick
+// startup log line rather than a UI printer picker.
+ipcMain.handle('get-available-printers', async () => {
+  try {
+    const win = BrowserWindow.getFocusedWindow() || BrowserWindow.getAllWindows()[0];
+    if (!win) return [];
+    const printers = await win.webContents.getPrintersAsync();
+    return printers.map((p) => String(p.name || ''));
+  } catch (err) {
+    console.error('get-available-printers error:', err);
+    return [];
+  }
+});
+
+// ============================================================
+// CASH DRAWER KICK (open-cash-drawer)
+// ============================================================
+//
+// Combined drawer-kick buffer covering the three common standards, so one
+// job attempts to trigger whichever pin/protocol the connected drawer
+// actually uses:
+//   - ESC p 0 (Pin 2): Epson, Xprinter, Rongta, and most generic clones
+//   - ESC p 1 (Pin 5): Star Micronics and alternates wired to the other pin
+//   - DLE DC4 (real-time pulse): the ESC/POS "real-time" drawer command
+// NOTE: if the target printer's driver isn't in genuine RAW-passthrough
+// mode, none of these variants will behave as commands — the printer will
+// instead render them as literal (garbled) text, same as any other raw byte
+// sequence sent this way. Widening this buffer doesn't fix that; the fix
+// for garbled text output is on the Windows printer-configuration side
+// (Printer Properties > Advanced > Print Processor should be RAW, or the
+// printer should be installed via a "Generic / Text Only"-style driver).
+const CASH_DRAWER_KICK_BYTES = Buffer.from([
+  0x1b, 0x70, 0x00, 0x19, 0xfa, // Pin 2
+  0x1b, 0x70, 0x01, 0x19, 0xfa, // Pin 5
+  0x10, 0x14, 0x01, 0x00, 0x05  // DLE real-time pulse
+]);
+
+// This deliberately does NOT go through webContents.print() at all.
+// Chromium's print pipeline renders whatever content it's given into a
+// rasterized page image before handing it to the printer driver — it has no
+// concept of "raw bytes", so embedding the kick bytes as page content would
+// just render them as (likely invisible/garbled) text, not deliver them as
+// commands the printer executes. The drawer would almost certainly not open,
+// even though the print job itself would report success.
+//
+// Instead this writes the raw bytes to a temp file and uses Windows' `copy
+// /b` raw pass-through directly to the printer queue — no new npm
+// dependency, but it does require the target printer to accept a raw
+// passthrough job (typically true when the printer is shared in Windows, or
+// installed with a "Generic / Text Only"-style driver). This can't be
+// verified without the actual hardware; if it fails, the error below should
+// say why rather than silently doing nothing.
+ipcMain.handle('open-cash-drawer', async (event, payload) => {
+  const requestedDeviceName =
+    (payload && (payload.deviceName || payload.printerName)) || DEFAULT_DEVICE_NAMES.cashier;
+
+  // Same exact-match resolution as every other print channel — no fallback
+  // to a different printer if CashierPrinter is offline/misconfigured.
+  const { matched: deviceName, available } = await resolvePrinterName(requestedDeviceName);
+  if (!deviceName) {
+    const error = `Target printer "${requestedDeviceName}" not found or offline. Cash drawer kick rejected to prevent misrouting. Available: ${available.join(', ') || '(none detected)'}`;
+    console.error(`open-cash-drawer: ${error}`);
+    return { success: false, error };
+  }
+
+  const tempFile = path.join(os.tmpdir(), `drawer_${Date.now()}.bin`);
+  let wroteTempFile = false;
+
+  try {
+    fs.writeFileSync(tempFile, CASH_DRAWER_KICK_BYTES);
+    wroteTempFile = true;
+
+    return await new Promise((resolve) => {
+      const command = `copy /b "${tempFile}" "\\\\localhost\\${deviceName}"`;
+      exec(command, { windowsHide: true }, (err, stdout, stderr) => {
+        if (err) {
+          const error =
+            `Cash drawer kick failed on "${deviceName}": ${err.message.trim()}. This usually means the ` +
+            'printer isn\'t shared in Windows (Devices and Printers > printer Properties > Sharing) or its ' +
+            'driver doesn\'t accept a raw passthrough job.';
+          console.error(`open-cash-drawer: ${error}`, stderr ? `stderr: ${stderr.trim()}` : '');
+          resolve({ success: false, error });
+          return;
+        }
+
+        resolve({ success: true });
+      });
+    });
+  } catch (err) {
+    console.error('open-cash-drawer: unexpected error:', err);
+    return { success: false, error: err.message };
+  } finally {
+    if (wroteTempFile) {
+      fs.unlink(tempFile, () => {}); // best-effort cleanup, not worth failing the whole call over
+    }
+  }
+});
+
 // Kiosk toggle for touch terminals (same effect as the Escape/F11 shortcut)
 ipcMain.handle('toggle-kiosk', () => {
   if (!mainWindow || mainWindow.isDestroyed()) return false;
@@ -272,6 +376,10 @@ ipcMain.handle('close-window', () => {
 // mismatch/failure must fail loudly rather than risk cross-printing a
 // receipt onto whatever printer happens to be set as Windows default.
 ipcMain.on('print-receipt', async (event, options = {}) => {
+  // This channel is HARDCODED to CashierPrinter and does not read any
+  // printer-name field from options — logged explicitly so this is visible
+  // on every call, not just inferred from behavior.
+  console.log('[Electron Print] print-receipt (legacy, hardcoded) — deviceName: CashierPrinter');
   const isSilent = options.silent !== undefined ? options.silent : true;
 
   // Same resolve-before-print standard as the two main handlers below, even
@@ -297,6 +405,7 @@ ipcMain.on('print-receipt', async (event, options = {}) => {
 
 // 2. KITCHEN KOT AUTO-PRINT
 ipcMain.on('print-kot', async (event, kotHtml) => {
+  console.log('[Electron Print] print-kot (legacy, hardcoded) — deviceName: KitchenPrinter');
   const { matched, available } = await resolvePrinterName('KitchenPrinter');
   if (!matched) {
     console.error(`print-kot: KitchenPrinter not found. Available: ${available.join(', ') || '(none detected)'}`);
@@ -323,6 +432,7 @@ ipcMain.on('print-kot', async (event, kotHtml) => {
 
 // 3. BARCODE STICKER LABEL AUTO-PRINT
 ipcMain.on('print-barcode', async (event, barcodeHtml) => {
+  console.log('[Electron Print] print-barcode (legacy, hardcoded) — deviceName: BarcodePrinter');
   const { matched, available } = await resolvePrinterName('BarcodePrinter');
   if (!matched) {
     console.error(`print-barcode: BarcodePrinter not found. Available: ${available.join(', ') || '(none detected)'}`);
@@ -354,7 +464,8 @@ ipcMain.on('print-barcode', async (event, barcodeHtml) => {
 const DEFAULT_DEVICE_NAMES = {
   cashier: 'CashierPrinter',
   kitchen: 'KitchenPrinter',
-  bot: 'BarPrinter',
+  kot: 'KitchenPrinter',
+  bot: 'BotPrinter',
   bar: 'BarPrinter',
   barcode: 'BarcodePrinter'
 };
@@ -453,24 +564,50 @@ async function printSilentJob({ type, htmlContent, settings = {} } = {}) {
   // instead of nested correctly) — all still funnel through the same
   // resolvePrinterName exact-match check below, so a wrong guess here just
   // fails with a clear "Printer not found" error, never a silent misroute.
-  const requestedDeviceName =
+  let requestedDeviceName =
     settings.deviceName ||
     settings.printerName ||
     settings.printer ||
     settings.device ||
-    settings.name ||
-    DEFAULT_DEVICE_NAMES[type] ||
-    DEFAULT_DEVICE_NAMES.cashier;
+    settings.name;
+
+  if (!requestedDeviceName) {
+    const normalizedType = typeof type === 'string' ? type.trim().toLowerCase() : '';
+    if (!normalizedType) {
+      // Nothing identifying a target at all — reasonable to default to the
+      // cashier printer (e.g. the Hardware Setup Test Print button).
+      requestedDeviceName = DEFAULT_DEVICE_NAMES.cashier;
+    } else if (DEFAULT_DEVICE_NAMES[normalizedType]) {
+      requestedDeviceName = DEFAULT_DEVICE_NAMES[normalizedType];
+    } else {
+      // A type WAS given but doesn't match any known station. This must
+      // NOT fall through to DEFAULT_DEVICE_NAMES.cashier — that was the
+      // actual bug: a caller sending type:'kot' (or 'Kitchen'/'KITCHEN',
+      // before the case-normalization above) intends a specific kitchen
+      // print, and silently defaulting an unrecognized-but-explicit type to
+      // the cashier printer is exactly the kind of misroute this project
+      // has a standing rule against — an unspecified target defaulting to
+      // cashier is fine, but an unrecognized one must fail loudly instead.
+      const known = Object.keys(DEFAULT_DEVICE_NAMES).join(', ');
+      const error = `Unknown print type: "${type}". Known types: ${known}`;
+      console.error(`Print job routing failed: ${error}`);
+      return { success: false, error };
+    }
+  }
+
+  console.log(`[Electron Print] print-silent-job — type: "${type}", requested deviceName: "${requestedDeviceName}"`);
 
   // Fail fast, before spinning up a headless window, on an unresolvable
   // printer name — see resolvePrinterName's own comment for why this is an
   // exact match only, not a "contains" guess.
   const { matched: deviceName, available } = await resolvePrinterName(requestedDeviceName);
   if (!deviceName) {
-    const error = `Printer not found: "${requestedDeviceName}". Available: ${available.join(', ') || '(none detected)'}`;
+    const error = `Target printer "${requestedDeviceName}" not found or offline. Print rejected to prevent misrouting. Available: ${available.join(', ') || '(none detected)'}`;
     console.error(`Print job routing failed (type: ${type}): ${error}`);
     return { success: false, error };
   }
+
+  console.log(`[Electron Print] print-silent-job — resolved deviceName: "${deviceName}"`);
 
   return new Promise((resolve) => {
     const fullHtml = buildPrintDocument(htmlContent || '', paperWidthMm, paperHeightMm);
@@ -536,9 +673,12 @@ async function printSilentJob({ type, htmlContent, settings = {} } = {}) {
       // Same transform-based shrink as print-receipt-silent, switched to a
       // center-anchored scale for symmetric margins — see that handler's
       // comment for the full reasoning. Not applied to barcode jobs, which
-      // have their own exact physical dimensions.
+      // have their own exact physical dimensions. Case-insensitive, same
+      // reasoning as the station-name lookup above (a caller could send
+      // 'Barcode'/'BARCODE' just as easily as 'kot' vs 'kitchen').
+      const isBarcodeType = typeof type === 'string' && type.trim().toLowerCase() === 'barcode';
       await win.webContents.insertCSS(`
-        ${type === 'barcode' ? '' : `
+        ${isBarcodeType ? '' : `
         html {
           transform: scale(0.97) !important;
           transform-origin: top center !important;
@@ -632,6 +772,7 @@ ipcMain.handle('print-silent-job', async (event, data) => {
 // ============================================================
 
 ipcMain.handle('print-receipt-silent', async (event, payload, ...args) => {
+  console.log('[IPC RAW ARGS]', payload, ...args);
   let printWin = null;
   try {
     let html = '';
@@ -669,6 +810,8 @@ ipcMain.handle('print-receipt-silent', async (event, payload, ...args) => {
       html = '<div style="font-family:monospace;font-size:12px;text-align:center;padding:10px;">TEST PRINT SUCCESSFUL</div>';
     }
 
+    console.log(`[Electron Print] print-receipt-silent — requested deviceName: "${printerName}"`);
+
     // Fail fast, before spinning up a headless window, on an unresolvable
     // printer name — see resolvePrinterName's own comment for why this is an
     // exact match only, not a "contains" guess.
@@ -676,10 +819,12 @@ ipcMain.handle('print-receipt-silent', async (event, payload, ...args) => {
     const printerResolution = await resolvePrinterName(requestedPrinterName);
     printerName = printerResolution.matched;
     if (!printerName) {
-      const error = `Printer not found: "${requestedPrinterName}". Available: ${printerResolution.available.join(', ') || '(none detected)'}`;
+      const error = `Target printer "${requestedPrinterName}" not found or offline. Print rejected to prevent misrouting. Available: ${printerResolution.available.join(', ') || '(none detected)'}`;
       console.error(`print-receipt-silent routing failed: ${error}`);
       return { success: false, error };
     }
+
+    console.log(`[Electron Print] print-receipt-silent — resolved deviceName: "${printerName}"`);
 
     // Reset to 1.0: no hardware result or diagnostic log came back on the
     // 0.85 attempt, and this round switches the shrink mechanism to a CSS
