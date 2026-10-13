@@ -133,6 +133,13 @@ function createWindow() {
           return btn;
         }
 
+        var updateBtn = makeButton('\\u21BB', '#2d6a4f', 'Check for updates', function () {
+          if (window.electronAPI && window.electronAPI.checkForUpdates) {
+            window.electronAPI.checkForUpdates();
+          }
+          closeDrawer();
+        });
+
         var minimizeBtn = makeButton('\\u2212', '#444444', 'Minimize', function () {
           if (window.electronAPI && window.electronAPI.minimizeWindow) {
             window.electronAPI.minimizeWindow();
@@ -149,6 +156,7 @@ function createWindow() {
           closeDrawer();
         });
 
+        drawer.appendChild(updateBtn);
         drawer.appendChild(minimizeBtn);
         drawer.appendChild(closeBtn);
         document.body.appendChild(trigger);
@@ -1836,6 +1844,17 @@ app.whenReady().then(() => {
   // hardware check; harmless if raw printing is never used (idle PowerShell).
   const prewarm = setTimeout(prewarmRawWorker, 8000);
   if (prewarm.unref) prewarm.unref();
+
+  // Auto-update (GitHub Releases). Required and started inside a try so that
+  // any problem here can only switch updating off — never stop the POS from
+  // launching. Checks run ~45s after launch and every 6h; nothing downloads or
+  // restarts without the cashier tapping a button. See updater.js.
+  try {
+    const { createUpdater } = require('./updater');
+    createUpdater({ getWindow: () => mainWindow }).start();
+  } catch (err) {
+    console.error('[Updater] could not start (the POS is unaffected, but updates are off):', err);
+  }
 });
 
 app.on('window-all-closed', () => {

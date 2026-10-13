@@ -1,21 +1,29 @@
 {
   "name": "virel-pos",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "description": "Virel POS Dedicated Desktop Launcher",
   "main": "main.js",
   "scripts": {
     "start": "electron .",
-    "build": "electron-builder --win",
-    "dist": "electron-builder --win"
+    "build": "electron-builder --win --publish never",
+    "dist": "electron-builder --win --publish never"
   },
   "build": {
     "appId": "com.kalvexit.virelpos",
     "productName": "Virel POS",
+    "publish": [
+      {
+        "provider": "github",
+        "owner": "AshenSankalpa",
+        "repo": "KALVEX-IT-BROWSER"
+      }
+    ],
     "win": {
       "target": "nsis",
       "icon": "icon.ico"
     },
     "nsis": {
+      "artifactName": "Virel-POS-Setup-${version}.${ext}",
       "installerIcon": "icon.ico",
       "uninstallerIcon": "icon.ico",
       "uninstallDisplayName": "Virel POS",
@@ -30,6 +38,7 @@
     "electron-builder": "^26.15.3"
   },
   "dependencies": {
-    "electron-store": "^8.2.0"
+    "electron-store": "^8.2.0",
+    "electron-updater": "^6.8.9"
   }
 }

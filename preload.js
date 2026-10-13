@@ -25,6 +25,26 @@ contextBridge.exposeInMainWorld('electronAPI', {
   // Returns: Promise<Array<{ name, displayName, isDefault, status }>>
   getPrinters: () => ipcRenderer.invoke('get-system-printers'),
 
+  // --- Auto-update (GitHub Releases; see updater.js) ---
+  // checkForUpdates()   manual check -> resolves the current state; the app also
+  //                     shows its own on-screen notice with Download / Restart buttons
+  // downloadUpdate()    only acts when an update is 'available'
+  // installUpdate()     only acts when one is 'downloaded' (silent install + relaunch)
+  // getUpdateState()    { status, currentVersion, version, percent, error, note, checkedAt }
+  //   status: idle | checking | available | downloading | downloaded | not-available | error | disabled
+  //   (disabled = running unpackaged; note 'no-release-published' = nothing on GitHub yet)
+  // onUpdateStatus(cb)  cb(state) on every change; returns an unsubscribe function
+  checkForUpdates: () => ipcRenderer.invoke('update-check'),
+  downloadUpdate: () => ipcRenderer.invoke('update-download'),
+  installUpdate: () => ipcRenderer.invoke('update-install'),
+  getUpdateState: () => ipcRenderer.invoke('update-get-state'),
+  onUpdateStatus: (callback) => {
+    if (typeof callback !== 'function') return () => {};
+    const handler = (event, state) => callback(state);
+    ipcRenderer.on('update-status', handler);
+    return () => ipcRenderer.removeListener('update-status', handler);
+  },
+
   // --- Persistent hardware config (survives restarts and reboots) ---
   // getHardwareConfig():  { printers, serialPorts, preferences, effectivePrinters, persisted }
   //   printers = what's SAVED (station -> Windows printer name);
