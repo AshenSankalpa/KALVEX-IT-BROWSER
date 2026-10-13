@@ -49,6 +49,17 @@ contextBridge.exposeInMainWorld('electronAPI', {
     return ipcRenderer.invoke('print-receipt-silent', ...args);
   },
 
+  // --- Unified silent print + optional drawer kick ---
+  // Same payload as printReceiptSilent, plus { openDrawer?: boolean,
+  // drawerPrinterName?: string }. Prints the web app's own receipt HTML with
+  // no dialog, then kicks the drawer if openDrawer is true (drawer is kicked
+  // even if the print fails, so a cash sale never stalls on a receipt error).
+  // Returns: Promise<{ success: boolean, error: string | null,
+  //                    drawer?: { success: boolean, error?: string } }>
+  // Variadic for the same reason as printReceiptSilent above — never name a
+  // single parameter here, or every argument after the first gets dropped.
+  printThermalReceipt: (...args) => ipcRenderer.invoke('print-thermal', ...args),
+
   // --- Cash drawer kick (no printing, no paper feed) ---
   // payload?: { deviceName?: string, printerName?: string } — defaults to
   // the cashier printer. Returns: Promise<{ success: boolean, error: string | null }>
@@ -62,5 +73,8 @@ contextBridge.exposeInMainWorld('electronAPI', {
 
   // --- Touch-friendly window controls (for terminals with no keyboard) ---
   minimizeWindow: () => ipcRenderer.invoke('minimize-window'),
+  // Toggles maximize/restore; resolves to the resulting isMaximized() state
+  // (always false while in kiosk mode, where it's a no-op).
+  maximizeWindow: () => ipcRenderer.invoke('maximize-window'),
   closeWindow: () => ipcRenderer.invoke('close-window')
 });

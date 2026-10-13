@@ -13,6 +13,8 @@ function createWindow() {
     width: 1280,
     height: 800,
     kiosk: true,              // Kiosk Full Screen Mode
+    frame: false,             // custom (in-page) title bar; drive it via minimizeWindow/maximizeWindow/closeWindow
+    backgroundColor: '#090d16', // matches the POS dark theme so there's no white flash before the page paints
     autoHideMenuBar: true,
     icon: path.join(__dirname, 'icon.ico'),
     webPreferences: {
@@ -297,7 +299,7 @@ const CASH_DRAWER_KICK_BYTES = Buffer.from([
 // installed with a "Generic / Text Only"-style driver). This can't be
 // verified without the actual hardware; if it fails, the error below should
 // say why rather than silently doing nothing.
-ipcMain.handle('open-cash-drawer', async (event, payload) => {
+async function kickCashDrawer(payload) {
   const requestedDeviceName =
     (payload && (payload.deviceName || payload.printerName)) || DEFAULT_DEVICE_NAMES.cashier;
 
@@ -341,7 +343,9 @@ ipcMain.handle('open-cash-drawer', async (event, payload) => {
       fs.unlink(tempFile, () => {}); // best-effort cleanup, not worth failing the whole call over
     }
   }
-});
+}
+
+ipcMain.handle('open-cash-drawer', (event, payload) => kickCashDrawer(payload));
 
 // Kiosk toggle for touch terminals (same effect as the Escape/F11 shortcut)
 ipcMain.handle('toggle-kiosk', () => {
@@ -360,6 +364,18 @@ ipcMain.handle('minimize-window', () => {
   if (mainWindow && !mainWindow.isDestroyed()) {
     mainWindow.minimize();
   }
+});
+
+// Toggles maximize/restore and returns the resulting state. No-op while in
+// kiosk mode — kiosk is already full-screen, and maximize() fights with it.
+ipcMain.handle('maximize-window', () => {
+  if (!mainWindow || mainWindow.isDestroyed() || mainWindow.isKiosk()) return false;
+  if (mainWindow.isMaximized()) {
+    mainWindow.unmaximize();
+  } else {
+    mainWindow.maximize();
+  }
+  return mainWindow.isMaximized();
 });
 
 ipcMain.handle('close-window', () => {
@@ -771,7 +787,7 @@ ipcMain.handle('print-silent-job', async (event, data) => {
 // (not global CSS shrink) + label printing support.
 // ============================================================
 
-ipcMain.handle('print-receipt-silent', async (event, payload, ...args) => {
+async function printReceiptSilentJob(payload, ...args) {
   console.log('[IPC RAW ARGS]', payload, ...args);
   let printWin = null;
   try {
@@ -1024,6 +1040,40 @@ ipcMain.handle('print-receipt-silent', async (event, payload, ...args) => {
       printWin.destroy();
     }
   }
+}
+
+ipcMain.handle('print-receipt-silent', (event, payload, ...args) => printReceiptSilentJob(payload, ...args));
+
+// ============================================================
+// UNIFIED ENTRY POINT (print-thermal) — window.electronAPI.printThermalReceipt
+// ============================================================
+//
+// One call for "print this receipt silently, and open the drawer if asked":
+// reuses the exact same pipeline as print-receipt-silent (so the web app's
+// own bill HTML/CSS is what gets printed — no dialog, no re-templating) and
+// the same drawer kick as open-cash-drawer. Nothing here is a second,
+// divergent print path.
+//
+// Payload = same shape as print-receipt-silent, plus:
+//   openDrawer?: boolean         kick the drawer after printing (default false —
+//                                the caller knows whether it's a cash sale)
+//   drawerPrinterName?: string   printer the drawer hangs off (default: the
+//                                receipt's printerName, else CashierPrinter)
+//
+// The drawer is kicked even if the print itself failed: a cash sale still
+// needs the drawer open, and blocking it on a receipt failure would stall
+// the till. Both outcomes are reported separately.
+ipcMain.handle('print-thermal', async (event, payload, ...args) => {
+  const printResult = await printReceiptSilentJob(payload, ...args);
+
+  const wantsDrawer = !!payload && typeof payload === 'object' && !!(payload.openDrawer || payload.kickDrawer);
+  if (!wantsDrawer) return printResult;
+
+  const drawerResult = await kickCashDrawer({
+    deviceName: payload.drawerPrinterName || payload.printerName || payload.deviceName
+  });
+
+  return { ...printResult, drawer: drawerResult };
 });
 
 app.whenReady().then(createWindow);
