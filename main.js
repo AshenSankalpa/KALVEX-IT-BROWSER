@@ -2,7 +2,8 @@ const { app, BrowserWindow, ipcMain } = require('electron');
 const path = require('path');
 const fs = require('fs');
 const os = require('os');
-const { exec, execFile } = require('child_process');
+const crypto = require('crypto');
+const { execFile, spawn } = require('child_process');
 const Store = require('electron-store');
 
 const POS_URL = 'https://virelpos.kalvexit.com';
@@ -294,24 +295,270 @@ const CASH_DRAWER_KICK_BYTES = Buffer.from([
   0x10, 0x14, 0x01, 0x00, 0x05  // DLE real-time pulse
 ]);
 
-// This deliberately does NOT go through webContents.print() at all.
-// Chromium's print pipeline renders whatever content it's given into a
-// rasterized page image before handing it to the printer driver — it has no
-// concept of "raw bytes", so embedding the kick bytes as page content would
-// just render them as (likely invisible/garbled) text, not deliver them as
-// commands the printer executes. The drawer would almost certainly not open,
-// even though the print job itself would report success.
+// ---- Raw transport -----------------------------------------------------
 //
-// Instead this writes the raw bytes to a temp file and uses Windows' `copy
-// /b` raw pass-through directly to the printer queue — no new npm
-// dependency, but it does require the target printer to accept a raw
-// passthrough job (typically true when the printer is shared in Windows, or
-// installed with a "Generic / Text Only"-style driver). This can't be
-// verified without the actual hardware; if it fails, the error below should
-// say why rather than silently doing nothing.
+// This deliberately does NOT go through webContents.print(). Chromium
+// rasterizes whatever it's given into a page image before the driver sees it,
+// so ESC/POS bytes sent that way would be rendered as text, not executed.
+//
+// Raw jobs go to the Windows print spooler directly with datatype "RAW"
+// (OpenPrinter / StartDocPrinter / WritePrinter), which hands the bytes to the
+// printer untouched. Unlike the `copy /b \\localhost\<name>` trick this
+// replaces, it needs no printer sharing. No native Node module either: a
+// small C# helper is compiled by PowerShell (Add-Type) once, cached as a DLL
+// in the app's data folder, and later jobs just load it. The DLL name carries
+// a hash of the source, so a changed helper can never load a stale DLL.
+// Requires Windows PowerShell with Add-Type allowed (it isn't under
+// Constrained Language Mode / some AppLocker setups — the error says so).
+const RAW_PRINTER_CS = `
+using System;
+using System.Runtime.InteropServices;
+public static class RawPrinterIO {
+  [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
+  public class DOCINFOW {
+    [MarshalAs(UnmanagedType.LPWStr)] public string pDocName;
+    [MarshalAs(UnmanagedType.LPWStr)] public string pOutputFile;
+    [MarshalAs(UnmanagedType.LPWStr)] public string pDataType;
+  }
+  [DllImport("winspool.drv", EntryPoint = "OpenPrinterW", SetLastError = true, CharSet = CharSet.Unicode, ExactSpelling = true)]
+  static extern bool OpenPrinter(string name, out IntPtr h, IntPtr defaults);
+  [DllImport("winspool.drv", SetLastError = true, ExactSpelling = true)] static extern bool ClosePrinter(IntPtr h);
+  [DllImport("winspool.drv", EntryPoint = "StartDocPrinterW", SetLastError = true, CharSet = CharSet.Unicode, ExactSpelling = true)]
+  static extern int StartDocPrinter(IntPtr h, int level, [In] DOCINFOW di);
+  [DllImport("winspool.drv", SetLastError = true, ExactSpelling = true)] static extern bool EndDocPrinter(IntPtr h);
+  [DllImport("winspool.drv", SetLastError = true, ExactSpelling = true)] static extern bool StartPagePrinter(IntPtr h);
+  [DllImport("winspool.drv", SetLastError = true, ExactSpelling = true)] static extern bool EndPagePrinter(IntPtr h);
+  [DllImport("winspool.drv", SetLastError = true, ExactSpelling = true)] static extern bool WritePrinter(IntPtr h, IntPtr bytes, int count, out int written);
+
+  // Returns "" on success, otherwise a short description of what failed.
+  public static string Send(string printer, byte[] data) {
+    IntPtr h;
+    if (!OpenPrinter(printer, out h, IntPtr.Zero)) return "OpenPrinter failed (Win32 error " + Marshal.GetLastWin32Error() + ")";
+    try {
+      DOCINFOW di = new DOCINFOW(); di.pDocName = "POS raw job"; di.pDataType = "RAW";
+      if (StartDocPrinter(h, 1, di) == 0) return "StartDocPrinter failed (Win32 error " + Marshal.GetLastWin32Error() + ")";
+      try {
+        if (!StartPagePrinter(h)) return "StartPagePrinter failed (Win32 error " + Marshal.GetLastWin32Error() + ")";
+        try {
+          IntPtr p = Marshal.AllocCoTaskMem(data.Length);
+          try {
+            Marshal.Copy(data, 0, p, data.Length);
+            int written;
+            if (!WritePrinter(h, p, data.Length, out written)) return "WritePrinter failed (Win32 error " + Marshal.GetLastWin32Error() + ")";
+            if (written != data.Length) return "WritePrinter wrote " + written + " of " + data.Length + " bytes";
+            return "";
+          } finally { Marshal.FreeCoTaskMem(p); }
+        } finally { EndPagePrinter(h); }
+      } finally { EndDocPrinter(h); }
+    } finally { ClosePrinter(h); }
+  }
+}
+`;
+const RAW_PRINTER_CS_HASH = crypto.createHash('sha1').update(RAW_PRINTER_CS).digest('hex').slice(0, 10);
+const RAW_JOB_TIMEOUT_MS = 20000; // per job, once the helper is running
+const MAX_RAW_BYTES = 2 * 1024 * 1024;
+
+// A long-lived helper: PowerShell starts and loads the helper DLL ONCE, then
+// reads one JSON job per line from stdin ({"id","printer","file"}) and answers
+// one JSON line per job ({"id","ok"} or {"id","error"}). Spawning PowerShell
+// per job cost 1-6 s, which is far too slow for a drawer kick on every cash
+// sale; a warm helper answers in milliseconds.
+//
+// Jobs are parsed as JSON data (ConvertFrom-Json), never spliced into script
+// text, so a printer name can't inject PowerShell. stdin/stdout use explicit
+// BOM-less UTF-8 streams instead of the console code page, so non-ASCII
+// printer names and error text survive the round trip.
+function buildRawWorkerScript() {
+  return `
+$ErrorActionPreference = 'Stop'
+$utf8 = New-Object System.Text.UTF8Encoding($false)
+$in = New-Object System.IO.StreamReader([Console]::OpenStandardInput(), $utf8)
+$out = New-Object System.IO.StreamWriter([Console]::OpenStandardOutput(), $utf8)
+$out.AutoFlush = $true
+try {
+  $src = @'
+${RAW_PRINTER_CS}
+'@
+  if (-not (Test-Path -LiteralPath $env:RAW_DLL)) {
+    $tmp = $env:RAW_DLL + '.' + $PID + '.tmp'
+    Add-Type -TypeDefinition $src -OutputAssembly $tmp
+    try { Move-Item -LiteralPath $tmp -Destination $env:RAW_DLL -ErrorAction Stop }
+    catch { Remove-Item -LiteralPath $tmp -ErrorAction SilentlyContinue }
+  }
+  Add-Type -Path $env:RAW_DLL
+} catch {
+  $out.WriteLine((@{ ready = $false; error = $_.Exception.Message } | ConvertTo-Json -Compress))
+  exit 3
+}
+$out.WriteLine('{"ready":true}')
+while ($true) {
+  $line = $in.ReadLine()
+  if ($null -eq $line) { break }
+  if (-not $line.Trim()) { continue }
+  $id = $null
+  try {
+    $job = $line | ConvertFrom-Json
+    $id = $job.id
+    $bytes = [System.IO.File]::ReadAllBytes([string]$job.file)
+    $err = [RawPrinterIO]::Send([string]$job.printer, $bytes)
+    if ($err) { $reply = @{ id = $id; error = $err } } else { $reply = @{ id = $id; ok = $true } }
+  } catch {
+    $reply = @{ id = $id; error = $_.Exception.Message }
+  }
+  $out.WriteLine(($reply | ConvertTo-Json -Compress))
+}
+`;
+}
+
+function getRawHelperDllPath() {
+  let dir;
+  try {
+    dir = app.getPath('userData');
+    fs.mkdirSync(dir, { recursive: true });
+  } catch (err) {
+    dir = os.tmpdir();
+  }
+  return path.join(dir, `raw-printer-io-${RAW_PRINTER_CS_HASH}.dll`);
+}
+
+// ---- helper process lifecycle ----
+// One helper at a time. If it dies it is dropped and the next job (or the
+// prewarm) starts a fresh one; a job that times out kills it, since a wedged
+// helper would otherwise stall every job queued behind it.
+let rawWorker = null;
+
+function spawnRawWorker() {
+  const encodedScript = Buffer.from(buildRawWorkerScript(), 'utf16le').toString('base64');
+  const proc = spawn(
+    'powershell.exe',
+    ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-EncodedCommand', encodedScript],
+    { windowsHide: true, env: { ...process.env, RAW_DLL: getRawHelperDllPath() } }
+  );
+
+  const worker = { proc, pending: new Map(), nextId: 1, buffer: '', dead: false };
+  let readySettled = false;
+  worker.ready = new Promise((resolve, reject) => {
+    worker.markReady = () => { if (!readySettled) { readySettled = true; resolve(); } };
+    worker.markFailed = (message) => { if (!readySettled) { readySettled = true; reject(new Error(message)); } };
+  });
+  worker.ready.catch(() => {}); // the prewarm doesn't await it; failures are reported where they matter
+
+  const startupTimer = setTimeout(() => {
+    worker.markFailed('print helper did not start within 30s');
+    try { proc.kill(); } catch (err) { /* already gone */ }
+  }, 30000);
+
+  const shutDown = (reason) => {
+    if (worker.dead) return;
+    worker.dead = true;
+    clearTimeout(startupTimer);
+    if (rawWorker === worker) rawWorker = null;
+    worker.markFailed(reason);
+    for (const job of worker.pending.values()) {
+      clearTimeout(job.timer);
+      job.resolve({ success: false, error: reason });
+    }
+    worker.pending.clear();
+  };
+
+  proc.stdout.setEncoding('utf8');
+  proc.stdout.on('data', (chunk) => {
+    worker.buffer += chunk;
+    let newline;
+    while ((newline = worker.buffer.indexOf('\n')) >= 0) {
+      const line = worker.buffer.slice(0, newline).trim();
+      worker.buffer = worker.buffer.slice(newline + 1);
+      if (!line) continue;
+      let message;
+      try { message = JSON.parse(line); } catch (err) { continue; }
+      if (message.ready === true) {
+        clearTimeout(startupTimer);
+        worker.markReady();
+      } else if (message.ready === false) {
+        worker.markFailed(`print helper failed to load: ${message.error || 'unknown error'}`);
+      } else if (message.id !== undefined && worker.pending.has(message.id)) {
+        const job = worker.pending.get(message.id);
+        worker.pending.delete(message.id);
+        clearTimeout(job.timer);
+        job.resolve(message.ok ? { success: true } : { success: false, error: String(message.error || 'unknown error') });
+      }
+    }
+  });
+  proc.stderr.on('data', () => {}); // drain so the helper can never block on a full pipe
+  proc.stdin.on('error', () => {}); // EPIPE once the helper dies — the exit handler reports it
+  proc.on('error', (err) => shutDown(`could not start PowerShell: ${err.message}`));
+  proc.on('exit', (code) => shutDown(`print helper exited (code ${code})`));
+  return worker;
+}
+
+async function getRawWorker() {
+  if (!rawWorker || rawWorker.dead) rawWorker = spawnRawWorker();
+  const worker = rawWorker;
+  await worker.ready;
+  return worker;
+}
+
+// Start the helper in the background shortly after launch so the first real
+// drawer kick / raw print doesn't pay for PowerShell's cold start.
+function prewarmRawWorker() {
+  if (process.platform !== 'win32') return;
+  getRawWorker().catch((err) => {
+    console.warn('[Raw] print helper prewarm failed (it will be retried on first use):', err.message);
+  });
+}
+
+app.on('will-quit', () => {
+  if (rawWorker && !rawWorker.dead) {
+    try { rawWorker.proc.kill(); } catch (err) { /* already gone */ }
+  }
+});
+
+// Sends bytes to an already-resolved Windows printer queue. Never rejects.
+// Resolves { success: true, bytes } or { success: false, error }.
+async function sendRawToPrinter(printerName, bytes) {
+  const tempFile = path.join(
+    os.tmpdir(),
+    `rawjob_${process.pid}_${Date.now()}_${Math.random().toString(36).slice(2)}.bin`
+  );
+  try {
+    fs.writeFileSync(tempFile, bytes);
+  } catch (err) {
+    return { success: false, error: `could not stage the raw job: ${err.message}` };
+  }
+
+  try {
+    let worker;
+    try {
+      worker = await getRawWorker();
+    } catch (err) {
+      return { success: false, error: err.message };
+    }
+
+    const result = await new Promise((resolve) => {
+      const id = worker.nextId++;
+      const timer = setTimeout(() => {
+        worker.pending.delete(id);
+        resolve({ success: false, error: `timed out after ${RAW_JOB_TIMEOUT_MS / 1000}s` });
+        try { worker.proc.kill(); } catch (err) { /* already gone */ }
+      }, RAW_JOB_TIMEOUT_MS);
+      worker.pending.set(id, { resolve, timer });
+      worker.proc.stdin.write(JSON.stringify({ id, printer: printerName, file: tempFile }) + '\n');
+    });
+    return result.success ? { success: true, bytes: bytes.length } : result;
+  } finally {
+    fs.unlink(tempFile, () => {}); // best-effort cleanup
+  }
+}
+
+// ---- Cash drawer -------------------------------------------------------
+
 async function kickCashDrawer(payload) {
+  // A bare string is taken as the printer name — without this, a caller
+  // passing 'KitchenPrinter' would be ignored and silently kick the cashier.
   const requestedDeviceName =
-    (payload && (payload.deviceName || payload.printerName)) || DEFAULT_DEVICE_NAMES.cashier;
+    (typeof payload === 'string' && payload.trim()) ||
+    (payload && (payload.deviceName || payload.printerName)) ||
+    DEFAULT_DEVICE_NAMES.cashier;
 
   // Same exact-match resolution as every other print channel — no fallback
   // to a different printer if CashierPrinter is offline/misconfigured.
@@ -322,40 +569,143 @@ async function kickCashDrawer(payload) {
     return { success: false, error };
   }
 
-  const tempFile = path.join(os.tmpdir(), `drawer_${Date.now()}.bin`);
-  let wroteTempFile = false;
-
-  try {
-    fs.writeFileSync(tempFile, CASH_DRAWER_KICK_BYTES);
-    wroteTempFile = true;
-
-    return await new Promise((resolve) => {
-      const command = `copy /b "${tempFile}" "\\\\localhost\\${deviceName}"`;
-      exec(command, { windowsHide: true }, (err, stdout, stderr) => {
-        if (err) {
-          const error =
-            `Cash drawer kick failed on "${deviceName}": ${err.message.trim()}. This usually means the ` +
-            'printer isn\'t shared in Windows (Devices and Printers > printer Properties > Sharing) or its ' +
-            'driver doesn\'t accept a raw passthrough job.';
-          console.error(`open-cash-drawer: ${error}`, stderr ? `stderr: ${stderr.trim()}` : '');
-          resolve({ success: false, error });
-          return;
-        }
-
-        resolve({ success: true });
-      });
-    });
-  } catch (err) {
-    console.error('open-cash-drawer: unexpected error:', err);
-    return { success: false, error: err.message };
-  } finally {
-    if (wroteTempFile) {
-      fs.unlink(tempFile, () => {}); // best-effort cleanup, not worth failing the whole call over
-    }
+  const result = await sendRawToPrinter(deviceName, CASH_DRAWER_KICK_BYTES);
+  if (!result.success) {
+    const error = `Cash drawer kick failed on "${deviceName}": ${result.error}`;
+    console.error(`open-cash-drawer: ${error}`);
+    return { success: false, error };
   }
+  return { success: true };
 }
 
 ipcMain.handle('open-cash-drawer', (event, payload) => kickCashDrawer(payload));
+
+// ---- print-raw-silent --------------------------------------------------
+//
+// window.electronAPI.printRawSilent(data) — send raw bytes (ESC/POS) to a
+// station printer with no dialog and no rendering. `data` may be:
+//   - bytes: Uint8Array / ArrayBuffer / Buffer, or a number array (0-255)
+//   - a string: latin1 (1 char = 1 byte) unless { encoding } says otherwise;
+//     a string with characters above 0xFF is rejected rather than truncated
+//   - an object: { data | bytes | buffer | raw | commands, encoding?,
+//       printerName | deviceName | printer | targetPrinter | name | device?,
+//       type? ('cashier' | 'kitchen' | 'kot' | 'bot' | 'bar' | 'barcode') }
+// or positional: (bytes, printerName).
+// Printer rules match every other channel: an explicit name wins, else a
+// known station `type`, else (nothing given at all) the cashier printer; an
+// unknown type or an uninstalled printer FAILS instead of guessing.
+const RAW_ENCODINGS = new Set(['base64', 'hex', 'latin1', 'binary', 'utf8', 'utf-8', 'ascii']);
+const RAW_DATA_KEYS = ['data', 'bytes', 'buffer', 'raw', 'commands'];
+const RAW_PRINTER_NAME_KEYS = ['printerName', 'deviceName', 'printer', 'targetPrinter', 'name', 'device'];
+
+function isJsonBuffer(value) {
+  return !!value && typeof value === 'object' && value.type === 'Buffer' && Array.isArray(value.data);
+}
+
+function toRawBuffer(value, encoding) {
+  if (value === undefined || value === null) return { error: 'no data to print' };
+
+  let buf;
+  if (Buffer.isBuffer(value)) {
+    buf = Buffer.from(value);
+  } else if (value instanceof ArrayBuffer) {
+    buf = Buffer.from(new Uint8Array(value));
+  } else if (ArrayBuffer.isView(value)) {
+    buf = Buffer.from(new Uint8Array(value.buffer, value.byteOffset, value.byteLength));
+  } else if (isJsonBuffer(value)) {
+    return toRawBuffer(value.data);
+  } else if (Array.isArray(value)) {
+    for (let i = 0; i < value.length; i += 1) {
+      if (!Number.isInteger(value[i]) || value[i] < 0 || value[i] > 255) {
+        return { error: `byte array has an invalid value at index ${i} (each must be an integer 0-255)` };
+      }
+    }
+    buf = Buffer.from(value);
+  } else if (typeof value === 'string') {
+    let enc = typeof encoding === 'string' ? encoding.trim().toLowerCase() : '';
+    if (enc && !RAW_ENCODINGS.has(enc)) {
+      return { error: `unsupported encoding "${encoding}" (use one of: ${[...RAW_ENCODINGS].join(', ')})` };
+    }
+    if (!enc) {
+      for (let i = 0; i < value.length; i += 1) {
+        if (value.charCodeAt(i) > 255) {
+          return { error: 'string contains characters above 0xFF; send bytes, or pass an encoding such as "utf8"/"base64"/"hex"' };
+        }
+      }
+      enc = 'latin1';
+    }
+    if (enc === 'hex' && (value.length % 2 !== 0 || !/^[0-9a-f]*$/i.test(value))) {
+      return { error: 'invalid hex string (needs an even number of 0-9a-f characters)' };
+    }
+    if (enc === 'base64' && !/^[A-Za-z0-9+/\s]*={0,2}\s*$/.test(value)) {
+      return { error: 'invalid base64 string' };
+    }
+    buf = Buffer.from(value, enc);
+  } else {
+    return { error: `unsupported data type "${typeof value}" (send bytes, a number array, or a string)` };
+  }
+
+  if (buf.length === 0) return { error: 'no data to print (0 bytes)' };
+  if (buf.length > MAX_RAW_BYTES) return { error: `raw job is ${buf.length} bytes; the limit is ${MAX_RAW_BYTES}` };
+  return { buffer: buf };
+}
+
+async function printRawSilentJob(data, ...rest) {
+  try {
+    let value = data;
+    let encoding;
+    let explicitName;
+    let type;
+
+    const isOptionsObject =
+      !!data && typeof data === 'object' && !Buffer.isBuffer(data) && !ArrayBuffer.isView(data) &&
+      !(data instanceof ArrayBuffer) && !Array.isArray(data) && !isJsonBuffer(data);
+
+    if (isOptionsObject) {
+      const dataKey = RAW_DATA_KEYS.find((k) => data[k] !== undefined);
+      value = dataKey ? data[dataKey] : undefined;
+      encoding = data.encoding;
+      explicitName = RAW_PRINTER_NAME_KEYS.map((k) => data[k]).find((v) => v !== undefined && v !== null && v !== '');
+      type = data.type || data.station;
+    } else if (typeof rest[0] === 'string') {
+      explicitName = rest[0];
+    }
+
+    const converted = toRawBuffer(value, encoding);
+    if (converted.error) {
+      const error = `print-raw-silent: ${converted.error}`;
+      console.error(error);
+      return { success: false, error };
+    }
+
+    const target = resolveStationTarget(explicitName, type);
+    if (target.error) {
+      console.error(`print-raw-silent routing failed: ${target.error}`);
+      return { success: false, error: target.error };
+    }
+
+    const { matched, available } = await resolvePrinterName(target.name);
+    if (!matched) {
+      const error = `Target printer "${target.name}" not found or offline. Raw print rejected to prevent misrouting. Available: ${available.join(', ') || '(none detected)'}`;
+      console.error(`print-raw-silent routing failed: ${error}`);
+      return { success: false, error };
+    }
+
+    console.log(`[Electron Print] print-raw-silent — printer "${matched}", ${converted.buffer.length} bytes`);
+    const result = await sendRawToPrinter(matched, converted.buffer);
+    if (!result.success) {
+      const error = `Raw print to "${matched}" failed: ${result.error}`;
+      console.error(`print-raw-silent: ${error}`);
+      return { success: false, error };
+    }
+    return { success: true, error: null, printer: matched, bytes: result.bytes };
+  } catch (err) {
+    console.error('print-raw-silent: unexpected error:', err);
+    return { success: false, error: err.message };
+  }
+}
+
+ipcMain.handle('print-raw-silent', (event, data, ...rest) => printRawSilentJob(data, ...rest));
 
 // Kiosk toggle for touch terminals (same effect as the Escape/F11 shortcut)
 ipcMain.handle('toggle-kiosk', () => {
@@ -535,6 +885,32 @@ async function resolvePrinterName(requestedName) {
   const cleanTarget = requestedName.trim().toLowerCase();
   const exact = printers.find((p) => p.name.trim().toLowerCase() === cleanTarget);
   return { matched: exact ? exact.name : null, available };
+}
+
+// Single rule for "which station's printer is this request for", shared by
+// print-silent-job and print-raw-silent so they can't drift apart:
+//   explicit printer name  -> used as given (still checked against the
+//                             installed printers by the caller)
+//   known station `type`   -> that station's printer (case/space-insensitive)
+//   nothing given at all   -> the cashier printer (e.g. a generic test print)
+//   a type that isn't a known station -> ERROR. It must never default to the
+//   cashier: a caller that said 'kot' and got the cashier printer is exactly
+//   how a kitchen ticket ends up on the wrong printer.
+// Returns { name } or { error }. `type` comes from the web page, so lookup is
+// by own property only ("constructor" must not resolve to a function).
+function resolveStationTarget(explicitName, type) {
+  if (explicitName !== undefined && explicitName !== null && explicitName !== '') {
+    if (typeof explicitName !== 'string' || !explicitName.trim()) {
+      return { error: 'Printer name must be a non-empty string.' };
+    }
+    return { name: explicitName };
+  }
+  const normalizedType = typeof type === 'string' ? type.trim().toLowerCase() : '';
+  if (!normalizedType) return { name: DEFAULT_DEVICE_NAMES.cashier };
+  if (Object.prototype.hasOwnProperty.call(DEFAULT_DEVICE_NAMES, normalizedType)) {
+    return { name: DEFAULT_DEVICE_NAMES[normalizedType] };
+  }
+  return { error: `Unknown print type: "${type}". Known types: ${Object.keys(DEFAULT_DEVICE_NAMES).join(', ')}` };
 }
 
 // ============================================================
@@ -972,36 +1348,17 @@ async function printSilentJob({ type, htmlContent, settings = {} } = {}) {
   // instead of nested correctly) — all still funnel through the same
   // resolvePrinterName exact-match check below, so a wrong guess here just
   // fails with a clear "Printer not found" error, never a silent misroute.
-  let requestedDeviceName =
-    settings.deviceName ||
-    settings.printerName ||
-    settings.printer ||
-    settings.device ||
-    settings.name;
-
-  if (!requestedDeviceName) {
-    const normalizedType = typeof type === 'string' ? type.trim().toLowerCase() : '';
-    if (!normalizedType) {
-      // Nothing identifying a target at all — reasonable to default to the
-      // cashier printer (e.g. the Hardware Setup Test Print button).
-      requestedDeviceName = DEFAULT_DEVICE_NAMES.cashier;
-    } else if (DEFAULT_DEVICE_NAMES[normalizedType]) {
-      requestedDeviceName = DEFAULT_DEVICE_NAMES[normalizedType];
-    } else {
-      // A type WAS given but doesn't match any known station. This must
-      // NOT fall through to DEFAULT_DEVICE_NAMES.cashier — that was the
-      // actual bug: a caller sending type:'kot' (or 'Kitchen'/'KITCHEN',
-      // before the case-normalization above) intends a specific kitchen
-      // print, and silently defaulting an unrecognized-but-explicit type to
-      // the cashier printer is exactly the kind of misroute this project
-      // has a standing rule against — an unspecified target defaulting to
-      // cashier is fine, but an unrecognized one must fail loudly instead.
-      const known = Object.keys(DEFAULT_DEVICE_NAMES).join(', ');
-      const error = `Unknown print type: "${type}". Known types: ${known}`;
-      console.error(`Print job routing failed: ${error}`);
-      return { success: false, error };
-    }
+  // Explicit name > known station type > (nothing given) cashier; an unknown
+  // type is an error, never a silent cashier default — see resolveStationTarget.
+  const target = resolveStationTarget(
+    settings.deviceName || settings.printerName || settings.printer || settings.device || settings.name,
+    type
+  );
+  if (target.error) {
+    console.error(`Print job routing failed: ${target.error}`);
+    return { success: false, error: target.error };
   }
+  const requestedDeviceName = target.name;
 
   console.log(`[Electron Print] print-silent-job — type: "${type}", requested deviceName: "${requestedDeviceName}"`);
 
@@ -1474,6 +1831,11 @@ app.whenReady().then(() => {
   initHardwareStore();
   applyPrinterMapping();
   createWindow();
+
+  // Deferred so it doesn't compete with the POS page loading and the startup
+  // hardware check; harmless if raw printing is never used (idle PowerShell).
+  const prewarm = setTimeout(prewarmRawWorker, 8000);
+  if (prewarm.unref) prewarm.unref();
 });
 
 app.on('window-all-closed', () => {

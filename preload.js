@@ -79,6 +79,17 @@ contextBridge.exposeInMainWorld('electronAPI', {
   // single parameter here, or every argument after the first gets dropped.
   printThermalReceipt: (...args) => ipcRenderer.invoke('print-thermal', ...args),
 
+  // --- Raw ESC/POS bytes straight to a printer (no dialog, no rendering) ---
+  // data: bytes (Uint8Array/ArrayBuffer/number[]), a latin1 string, or
+  //   { data|bytes|buffer|raw|commands, encoding?: 'base64'|'hex'|'latin1'|'utf8',
+  //     printerName? (or deviceName/printer/targetPrinter), type? } — or
+  //   positionally: printRawSilent(bytes, printerName).
+  // No printer named -> cashier; an unknown `type` or uninstalled printer is
+  // rejected, never guessed. Returns: Promise<{ success, error, printer?, bytes? }>
+  // Variadic on purpose — see printReceiptSilent: a single named parameter
+  // would silently drop a positional printer name.
+  printRawSilent: (...args) => ipcRenderer.invoke('print-raw-silent', ...args),
+
   // --- Cash drawer kick (no printing, no paper feed) ---
   // payload?: { deviceName?: string, printerName?: string } — defaults to
   // the cashier printer. Returns: Promise<{ success: boolean, error: string | null }>
