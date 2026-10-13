@@ -5,10 +5,16 @@
   "main": "main.js",
   "scripts": {
     "start": "electron .",
-    "build": "electron-builder --win --publish never",
-    "dist": "electron-builder --win --publish never"
+    "build": "electron-builder --win --publish never && node scripts/clean-dist.js",
+    "build:debug": "electron-builder --win --publish never",
+    "dist": "npm run build"
   },
   "build": {
+    "files": [
+      "**/*",
+      "!scripts/**",
+      "!dist/**"
+    ],
     "appId": "com.kalvexit.virelpos",
     "productName": "Virel POS",
     "publish": [
