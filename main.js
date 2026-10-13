@@ -2,11 +2,13 @@ const { app, BrowserWindow, ipcMain } = require('electron');
 const path = require('path');
 const fs = require('fs');
 const os = require('os');
-const { exec } = require('child_process');
+const { exec, execFile } = require('child_process');
+const Store = require('electron-store');
 
 const POS_URL = 'https://virelpos.kalvexit.com';
 
 let mainWindow;
+let hardwareStartupCheckDone = false;
 
 function createWindow() {
   mainWindow = new BrowserWindow({
@@ -28,6 +30,14 @@ function createWindow() {
 
   // Web App එකෙන් window.print() කැඳවූ විටද Cashier Silent Print ක්‍රියාත්මක වීම
   mainWindow.webContents.on('did-finish-load', () => {
+    // First load only (this event fires again on every reload/navigation):
+    // verify the printers saved in the hardware config are still there. Runs
+    // after the page loads so the notification toast has somewhere to render.
+    if (!hardwareStartupCheckDone) {
+      hardwareStartupCheckDone = true;
+      runStartupHardwareCheck();
+    }
+
     // The trailing `true;` keeps the script's completion value a primitive —
     // without it the completion value is the assigned Function itself, which
     // Electron cannot structured-clone back across the IPC boundary and throws
@@ -392,19 +402,21 @@ ipcMain.handle('close-window', () => {
 // mismatch/failure must fail loudly rather than risk cross-printing a
 // receipt onto whatever printer happens to be set as Windows default.
 ipcMain.on('print-receipt', async (event, options = {}) => {
-  // This channel is HARDCODED to CashierPrinter and does not read any
-  // printer-name field from options — logged explicitly so this is visible
-  // on every call, not just inferred from behavior.
-  console.log('[Electron Print] print-receipt (legacy, hardcoded) — deviceName: CashierPrinter');
+  // This channel always targets the CASHIER station (it does not read any
+  // printer-name field from options) — logged explicitly so this is visible
+  // on every call, not just inferred from behavior. The name comes from the
+  // shared station mapping, so a saved hardware config applies here too
+  // (this is the channel window.print() is routed to).
+  const cashierPrinter = DEFAULT_DEVICE_NAMES.cashier;
+  console.log(`[Electron Print] print-receipt (legacy, cashier station) — deviceName: ${cashierPrinter}`);
   const isSilent = options.silent !== undefined ? options.silent : true;
 
-  // Same resolve-before-print standard as the two main handlers below, even
-  // though this channel's target is already hardcoded (never empty) — this
+  // Same resolve-before-print standard as the two main handlers below — this
   // just turns a would-be generic native print failure into a clear,
   // actionable log line before we even try.
-  const { matched, available } = await resolvePrinterName('CashierPrinter');
+  const { matched, available } = await resolvePrinterName(cashierPrinter);
   if (!matched) {
-    console.error(`print-receipt: CashierPrinter not found. Available: ${available.join(', ') || '(none detected)'}`);
+    console.error(`print-receipt: ${cashierPrinter} not found. Available: ${available.join(', ') || '(none detected)'}`);
     return;
   }
 
@@ -421,10 +433,11 @@ ipcMain.on('print-receipt', async (event, options = {}) => {
 
 // 2. KITCHEN KOT AUTO-PRINT
 ipcMain.on('print-kot', async (event, kotHtml) => {
-  console.log('[Electron Print] print-kot (legacy, hardcoded) — deviceName: KitchenPrinter');
-  const { matched, available } = await resolvePrinterName('KitchenPrinter');
+  const kitchenPrinter = DEFAULT_DEVICE_NAMES.kitchen;
+  console.log(`[Electron Print] print-kot (legacy, kitchen station) — deviceName: ${kitchenPrinter}`);
+  const { matched, available } = await resolvePrinterName(kitchenPrinter);
   if (!matched) {
-    console.error(`print-kot: KitchenPrinter not found. Available: ${available.join(', ') || '(none detected)'}`);
+    console.error(`print-kot: ${kitchenPrinter} not found. Available: ${available.join(', ') || '(none detected)'}`);
     return;
   }
 
@@ -448,10 +461,11 @@ ipcMain.on('print-kot', async (event, kotHtml) => {
 
 // 3. BARCODE STICKER LABEL AUTO-PRINT
 ipcMain.on('print-barcode', async (event, barcodeHtml) => {
-  console.log('[Electron Print] print-barcode (legacy, hardcoded) — deviceName: BarcodePrinter');
-  const { matched, available } = await resolvePrinterName('BarcodePrinter');
+  const barcodePrinter = DEFAULT_DEVICE_NAMES.barcode;
+  console.log(`[Electron Print] print-barcode (legacy, barcode station) — deviceName: ${barcodePrinter}`);
+  const { matched, available } = await resolvePrinterName(barcodePrinter);
   if (!matched) {
-    console.error(`print-barcode: BarcodePrinter not found. Available: ${available.join(', ') || '(none detected)'}`);
+    console.error(`print-barcode: ${barcodePrinter} not found. Available: ${available.join(', ') || '(none detected)'}`);
     return;
   }
 
@@ -477,14 +491,20 @@ ipcMain.on('print-barcode', async (event, barcodeHtml) => {
 // NEW UNIFIED SILENT PRINT PIPELINE (print-silent-job)
 // ============================================================
 
-const DEFAULT_DEVICE_NAMES = {
+// Station -> Windows printer queue name. FACTORY_DEVICE_NAMES is what a fresh
+// install uses. DEFAULT_DEVICE_NAMES is the LIVE mapping every print handler
+// reads at call time — applyPrinterMapping() (see the hardware-config section
+// below) overwrites its entries in place from the persisted config, so a
+// saved selection takes effect everywhere without touching each call site.
+const FACTORY_DEVICE_NAMES = Object.freeze({
   cashier: 'CashierPrinter',
   kitchen: 'KitchenPrinter',
   kot: 'KitchenPrinter',
   bot: 'BotPrinter',
   bar: 'BarPrinter',
   barcode: 'BarcodePrinter'
-};
+});
+const DEFAULT_DEVICE_NAMES = { ...FACTORY_DEVICE_NAMES };
 
 const DEFAULT_PAPER_WIDTH_MM = 80;
 const DEFAULT_CONTINUOUS_HEIGHT_MICRONS = 300000; // 300mm virtual roll height
@@ -516,6 +536,378 @@ async function resolvePrinterName(requestedName) {
   const exact = printers.find((p) => p.name.trim().toLowerCase() === cleanTarget);
   return { matched: exact ? exact.name : null, available };
 }
+
+// ============================================================
+// PERSISTENT HARDWARE CONFIG + STARTUP HEALTH CHECK
+// ============================================================
+//
+// What "reconnect" means here: printers are owned by the Windows spooler —
+// this app never holds a connection to one, so there is nothing to
+// re-establish. On startup it re-reads the saved selection, applies it to the
+// live station mapping, and VERIFIES each saved printer is still installed
+// and not offline/paused. If one isn't, a small toast is shown and the check
+// is retried in the background (a USB printer often enumerates after the app
+// starts), without ever blocking the POS. No test print is sent — that would
+// waste paper on every launch.
+//
+// serialPorts / preferences are persisted and returned to the web app, but
+// nothing here opens a serial port: there is no serial driver in this app
+// (adding one means a native dependency), so there is nothing to reconnect.
+
+const HARDWARE_STATIONS = Object.keys(FACTORY_DEVICE_NAMES);
+const UNSAFE_KEYS = new Set(['__proto__', 'constructor', 'prototype']);
+const HARDWARE_RECHECK_INTERVAL_MS = 15000;
+const HARDWARE_RECHECK_MAX_ATTEMPTS = 20; // ~5 minutes, then stop polling
+
+// Windows PrinterStatus values (Get-Printer) that mean "installed but not
+// usable right now". Busy/Printing/Processing/Waiting/WarmingUp/TonerLow/etc.
+// are deliberately not here — those are normal operating states.
+const PRINTER_PROBLEM_STATUSES = new Set([
+  'paused', 'error', 'pendingdeletion', 'paperjam', 'paperout', 'paperproblem',
+  'offline', 'notavailable', 'outputbinfull', 'notoner', 'userintervention',
+  'outofmemory', 'dooropen', 'serverunknown'
+]);
+
+let hardwareStore = null;
+let lastHardwareStatus = null;
+let lastAnnouncedSignature = '';
+let hardwareRecheckTimer = null;
+
+function initHardwareStore() {
+  try {
+    hardwareStore = new Store({
+      name: 'hardware-config',
+      clearInvalidConfig: true, // a corrupted file resets to defaults instead of throwing at startup
+      defaults: { printers: {}, serialPorts: {}, preferences: {} }
+    });
+  } catch (err) {
+    hardwareStore = null;
+    console.error('[Hardware] could not open the config store — using factory defaults, nothing will be persisted:', err);
+  }
+}
+
+function readHardwareConfig() {
+  const empty = { printers: {}, serialPorts: {}, preferences: {} };
+  if (!hardwareStore) return empty;
+  try {
+    return {
+      printers: hardwareStore.get('printers') || {},
+      serialPorts: hardwareStore.get('serialPorts') || {},
+      preferences: hardwareStore.get('preferences') || {}
+    };
+  } catch (err) {
+    console.error('[Hardware] could not read saved config — using factory defaults:', err);
+    return empty;
+  }
+}
+
+// station -> printer name. Unknown stations and non-string/empty/oversized
+// names are dropped; null means "clear this station's saved selection".
+function sanitizePrinters(input) {
+  const out = {};
+  if (!input || typeof input !== 'object' || Array.isArray(input)) return out;
+  for (const [station, name] of Object.entries(input)) {
+    const key = String(station).trim().toLowerCase();
+    if (!HARDWARE_STATIONS.includes(key)) continue;
+    if (name === null) { out[key] = null; continue; }
+    if (typeof name !== 'string') continue;
+    const trimmed = name.trim();
+    if (trimmed && trimmed.length <= 200) out[key] = trimmed;
+  }
+  return out;
+}
+
+// Free-form settings (serial ports, preferences): plain objects of
+// strings/numbers/booleans only, bounded depth and size.
+function sanitizePlain(input, depth = 0) {
+  if (!input || typeof input !== 'object' || Array.isArray(input) || depth > 3) return undefined;
+  const out = {};
+  for (const [k, v] of Object.entries(input).slice(0, 50)) {
+    if (UNSAFE_KEYS.has(k)) continue;
+    if (typeof v === 'string') out[k] = v.slice(0, 200);
+    else if (typeof v === 'number' && Number.isFinite(v)) out[k] = v;
+    else if (typeof v === 'boolean') out[k] = v;
+    else if (v && typeof v === 'object') {
+      const nested = sanitizePlain(v, depth + 1);
+      if (nested) out[k] = nested;
+    }
+  }
+  return out;
+}
+
+// Overlays the saved printer selection onto the live station mapping.
+function applyPrinterMapping() {
+  const saved = readHardwareConfig().printers;
+  const merged = { ...FACTORY_DEVICE_NAMES };
+  for (const station of HARDWARE_STATIONS) {
+    if (typeof saved[station] === 'string' && saved[station]) merged[station] = saved[station];
+  }
+  // 'kot' is an alias of 'kitchen' unless it was saved explicitly.
+  if (!saved.kot && saved.kitchen) merged.kot = merged.kitchen;
+  Object.assign(DEFAULT_DEVICE_NAMES, merged);
+}
+
+// One call, no user input in the command. Resolves null (never rejects) if
+// PowerShell/Get-Printer is unavailable, so callers fall back to presence-only.
+function queryWindowsPrinterStates() {
+  const command =
+    "Get-Printer | Select-Object Name,@{n='Status';e={[string]$_.PrinterStatus}},WorkOffline | ConvertTo-Json -Compress";
+  return new Promise((resolve) => {
+    execFile(
+      'powershell.exe',
+      ['-NoProfile', '-NonInteractive', '-Command', command],
+      { windowsHide: true, timeout: 8000, maxBuffer: 1024 * 1024 },
+      (err, stdout) => {
+        if (err) {
+          console.warn('[Hardware] Get-Printer unavailable, checking presence only:', err.message);
+          resolve(null);
+          return;
+        }
+        try {
+          const text = String(stdout).trim();
+          const states = new Map();
+          if (text) {
+            const parsed = JSON.parse(text);
+            for (const row of Array.isArray(parsed) ? parsed : [parsed]) {
+              if (row && typeof row.Name === 'string') {
+                states.set(row.Name.trim().toLowerCase(), {
+                  status: String(row.Status || ''),
+                  workOffline: row.WorkOffline === true
+                });
+              }
+            }
+          }
+          resolve(states);
+        } catch (parseErr) {
+          console.warn('[Hardware] could not parse Get-Printer output, checking presence only:', parseErr.message);
+          resolve(null);
+        }
+      }
+    );
+  });
+}
+
+// Verifies every SAVED station printer. Stations with nothing saved are not
+// checked — a site that never configured a bar printer shouldn't get a
+// warning about it. Never throws.
+async function checkHardware() {
+  const saved = readHardwareConfig().printers;
+  const stations = Object.keys(saved).filter((s) => typeof saved[s] === 'string' && saved[s]);
+  const result = { checkedAt: new Date().toISOString(), ok: true, printers: [], problems: [], error: null };
+
+  if (stations.length === 0) {
+    lastHardwareStatus = result;
+    return result;
+  }
+
+  let installed;
+  try {
+    if (!mainWindow || mainWindow.isDestroyed()) throw new Error('main window not available');
+    installed = await mainWindow.webContents.getPrintersAsync();
+  } catch (err) {
+    result.ok = false;
+    result.error = `could not list installed printers: ${err.message}`;
+    lastHardwareStatus = result;
+    return result;
+  }
+
+  const installedNames = new Set(installed.map((p) => p.name.trim().toLowerCase()));
+  const states = await queryWindowsPrinterStates();
+
+  for (const station of stations) {
+    const wanted = saved[station];
+    const key = wanted.trim().toLowerCase();
+    const entry = { station, printerName: wanted, state: 'ready', reason: null };
+
+    if (!installedNames.has(key)) {
+      entry.state = 'missing';
+      entry.reason = 'not installed in Windows';
+    } else if (states) {
+      const s = states.get(key);
+      if (s && (s.workOffline || PRINTER_PROBLEM_STATUSES.has(s.status.toLowerCase()))) {
+        entry.state = 'attention';
+        entry.reason = s.workOffline ? 'set to "Use Printer Offline"' : `Windows reports "${s.status}"`;
+      }
+    }
+    result.printers.push(entry);
+  }
+
+  result.problems = result.printers.filter((e) => e.state !== 'ready');
+  result.ok = result.problems.length === 0;
+  lastHardwareStatus = result;
+  return result;
+}
+
+function describeHardwareProblems(problems) {
+  const byPrinter = new Map();
+  for (const p of problems) {
+    const group = byPrinter.get(p.printerName) || { stations: [], reason: p.reason };
+    group.stations.push(p.station);
+    byPrinter.set(p.printerName, group);
+  }
+  const parts = [...byPrinter.entries()].map(
+    ([name, g]) => `"${name}" (${g.stations.join('/')}) — ${g.reason}`
+  );
+  return `Saved printer unavailable: ${parts.join('; ')}. Prints to it will be rejected until it is back; everything else keeps working.`;
+}
+
+// Subtle bottom-left toast rendered inside the POS page (a native Windows
+// toast is unreliable over a kiosk full-screen window). Message text is set
+// with textContent and passed through JSON.stringify, so a printer name can't
+// inject markup or script.
+function showHardwareToast(message, level) {
+  if (!mainWindow || mainWindow.isDestroyed()) return;
+  const background = level === 'ok' ? '#1b5e20' : '#7a4b00';
+  const script = `
+    (function () {
+      var id = '__hw_toast__';
+      var old = document.getElementById(id);
+      if (old) old.remove();
+      if (!document.body) return;
+      var el = document.createElement('div');
+      el.id = id;
+      el.setAttribute('role', 'status');
+      el.textContent = ${JSON.stringify(message)};
+      el.style.cssText = 'position:fixed;left:16px;bottom:16px;max-width:380px;padding:10px 14px;' +
+        'border-radius:8px;font:13px/1.4 system-ui,sans-serif;color:#fff;background:' + ${JSON.stringify(background)} + ';' +
+        'box-shadow:0 2px 10px rgba(0,0,0,.35);z-index:2147483645;opacity:0;transition:opacity .25s;cursor:pointer';
+      el.addEventListener('click', function () { el.remove(); });
+      document.body.appendChild(el);
+      requestAnimationFrame(function () { el.style.opacity = '0.95'; });
+      setTimeout(function () {
+        el.style.opacity = '0';
+        setTimeout(function () { el.remove(); }, 300);
+      }, 10000);
+    })();
+    true;
+  `;
+  mainWindow.webContents.executeJavaScript(script).catch((err) => {
+    console.error('[Hardware] could not show notification:', err);
+  });
+}
+
+// Notifies only when the set of problems CHANGES (or clears), so the retry
+// loop doesn't re-toast the same problem every 15 seconds.
+function announceHardwareStatus(status) {
+  if (status.error) {
+    console.warn(`[Hardware] ${status.error}`);
+    return;
+  }
+  const signature = status.problems.map((p) => `${p.printerName}|${p.state}|${p.reason}`).sort().join(';');
+  if (signature === lastAnnouncedSignature) return;
+  const hadProblems = lastAnnouncedSignature !== '';
+  lastAnnouncedSignature = signature;
+
+  if (!status.ok) {
+    const message = describeHardwareProblems(status.problems);
+    console.warn(`[Hardware] ${message}`);
+    showHardwareToast(message, 'warn');
+  } else if (hadProblems) {
+    console.log('[Hardware] all saved printers are available again');
+    showHardwareToast('Saved printers are all available again.', 'ok');
+  }
+}
+
+function stopHardwareRecheck() {
+  if (hardwareRecheckTimer) {
+    clearTimeout(hardwareRecheckTimer);
+    hardwareRecheckTimer = null;
+  }
+}
+
+// Bounded background retry while something saved is unavailable.
+function scheduleHardwareRecheck() {
+  if (hardwareRecheckTimer) return;
+  let attempts = 0;
+  const tick = async () => {
+    hardwareRecheckTimer = null;
+    attempts += 1;
+    try {
+      const status = await checkHardware();
+      announceHardwareStatus(status);
+      if (status.ok) return;
+    } catch (err) {
+      console.error('[Hardware] background re-check failed (POS continues):', err);
+    }
+    if (attempts >= HARDWARE_RECHECK_MAX_ATTEMPTS) {
+      console.warn('[Hardware] still unavailable after repeated re-checks; no longer polling. Use check-hardware to re-test.');
+      return;
+    }
+    hardwareRecheckTimer = setTimeout(tick, HARDWARE_RECHECK_INTERVAL_MS);
+    if (hardwareRecheckTimer.unref) hardwareRecheckTimer.unref();
+  };
+  hardwareRecheckTimer = setTimeout(tick, HARDWARE_RECHECK_INTERVAL_MS);
+  if (hardwareRecheckTimer.unref) hardwareRecheckTimer.unref();
+}
+
+async function checkAndAnnounceHardware() {
+  const status = await checkHardware();
+  announceHardwareStatus(status);
+  if (status.ok) stopHardwareRecheck();
+  else if (!status.error) scheduleHardwareRecheck();
+  return status;
+}
+
+async function runStartupHardwareCheck() {
+  try {
+    await checkAndAnnounceHardware();
+  } catch (err) {
+    console.error('[Hardware] startup check failed (POS continues):', err);
+  }
+}
+
+ipcMain.handle('get-hardware-config', () => ({
+  ...readHardwareConfig(),
+  effectivePrinters: { ...DEFAULT_DEVICE_NAMES },
+  persisted: !!hardwareStore
+}));
+
+// partial = { printers?, serialPorts?, preferences? }
+//   printers      merged per station; a station set to null is cleared
+//   serialPorts   replaces the whole saved object
+//   preferences   replaces the whole saved object
+// A printer that isn't installed right now is still saved (it may simply be
+// switched off) — the returned status says so.
+ipcMain.handle('save-hardware-config', async (event, partial) => {
+  if (!hardwareStore) {
+    return { success: false, error: 'Hardware config storage is unavailable, so settings cannot be saved.' };
+  }
+  if (!partial || typeof partial !== 'object' || Array.isArray(partial)) {
+    return { success: false, error: 'Expected an object like { printers, serialPorts, preferences }.' };
+  }
+  try {
+    if ('printers' in partial) {
+      const next = { ...readHardwareConfig().printers };
+      for (const [station, name] of Object.entries(sanitizePrinters(partial.printers))) {
+        if (name === null) delete next[station];
+        else next[station] = name;
+      }
+      hardwareStore.set('printers', next);
+    }
+    if ('serialPorts' in partial) {
+      const serialPorts = sanitizePlain(partial.serialPorts);
+      if (serialPorts) hardwareStore.set('serialPorts', serialPorts);
+    }
+    if ('preferences' in partial) {
+      const preferences = sanitizePlain(partial.preferences);
+      if (preferences) hardwareStore.set('preferences', preferences);
+    }
+    applyPrinterMapping();
+    const status = await checkAndAnnounceHardware();
+    return { success: true, config: { ...readHardwareConfig(), effectivePrinters: { ...DEFAULT_DEVICE_NAMES } }, status };
+  } catch (err) {
+    console.error('[Hardware] save failed:', err);
+    return { success: false, error: err.message };
+  }
+});
+
+ipcMain.handle('check-hardware', async () => {
+  try {
+    return await checkAndAnnounceHardware();
+  } catch (err) {
+    return { ok: false, error: err.message, printers: [], problems: [] };
+  }
+});
 
 // Physical printable head is narrower than nominal paper width on thermal
 // rolls — industry-standard figures (also used elsewhere in this file):
@@ -1076,7 +1468,13 @@ ipcMain.handle('print-thermal', async (event, payload, ...args) => {
   return { ...printResult, drawer: drawerResult };
 });
 
-app.whenReady().then(createWindow);
+app.whenReady().then(() => {
+  // Saved printer selection must be live before the first print request can
+  // arrive; both steps are non-throwing (failures fall back to factory names).
+  initHardwareStore();
+  applyPrinterMapping();
+  createWindow();
+});
 
 app.on('window-all-closed', () => {
   if (process.platform !== 'darwin') app.quit();
