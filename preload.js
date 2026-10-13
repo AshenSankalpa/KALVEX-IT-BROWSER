@@ -25,6 +25,25 @@ contextBridge.exposeInMainWorld('electronAPI', {
   // Returns: Promise<Array<{ name, displayName, isDefault, status }>>
   getPrinters: () => ipcRenderer.invoke('get-system-printers'),
 
+  // --- Persistent hardware config (survives restarts and reboots) ---
+  // getHardwareConfig():  { printers, serialPorts, preferences, effectivePrinters, persisted }
+  //   printers = what's SAVED (station -> Windows printer name);
+  //   effectivePrinters = what prints actually use (saved over factory defaults).
+  // saveHardwareConfig({ printers?, serialPorts?, preferences? }):
+  //   printers merge per station (null clears one); serialPorts/preferences replace.
+  //   Stations: cashier | kitchen | kot | bot | bar | barcode.
+  //   Returns { success, config, status } or { success: false, error }.
+  // checkHardware(): verifies the SAVED printers are installed and not
+  //   offline/paused -> { ok, printers: [{ station, printerName, state:
+  //   'ready'|'missing'|'attention', reason }], problems, error }.
+  //   Also runs automatically once at startup (with a small on-screen notice
+  //   and bounded background retries if something is unavailable).
+  // NOTE: serialPorts are stored only — this app has no serial driver, so
+  //   nothing opens or reconnects a COM port.
+  getHardwareConfig: () => ipcRenderer.invoke('get-hardware-config'),
+  saveHardwareConfig: (config) => ipcRenderer.invoke('save-hardware-config', config),
+  checkHardware: () => ipcRenderer.invoke('check-hardware'),
+
   // --- Quick diagnostic: just the printer names, for startup logging ---
   // Returns: Promise<string[]>
   getAvailablePrinters: () => ipcRenderer.invoke('get-available-printers'),
@@ -59,6 +78,17 @@ contextBridge.exposeInMainWorld('electronAPI', {
   // Variadic for the same reason as printReceiptSilent above — never name a
   // single parameter here, or every argument after the first gets dropped.
   printThermalReceipt: (...args) => ipcRenderer.invoke('print-thermal', ...args),
+
+  // --- Raw ESC/POS bytes straight to a printer (no dialog, no rendering) ---
+  // data: bytes (Uint8Array/ArrayBuffer/number[]), a latin1 string, or
+  //   { data|bytes|buffer|raw|commands, encoding?: 'base64'|'hex'|'latin1'|'utf8',
+  //     printerName? (or deviceName/printer/targetPrinter), type? } — or
+  //   positionally: printRawSilent(bytes, printerName).
+  // No printer named -> cashier; an unknown `type` or uninstalled printer is
+  // rejected, never guessed. Returns: Promise<{ success, error, printer?, bytes? }>
+  // Variadic on purpose — see printReceiptSilent: a single named parameter
+  // would silently drop a positional printer name.
+  printRawSilent: (...args) => ipcRenderer.invoke('print-raw-silent', ...args),
 
   // --- Cash drawer kick (no printing, no paper feed) ---
   // payload?: { deviceName?: string, printerName?: string } — defaults to
